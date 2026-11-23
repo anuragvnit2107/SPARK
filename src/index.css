@@ -1,0 +1,97 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --rf-canvas-bg: #f8fafc;
+  --rf-grid: rgba(15, 23, 42, 0.08);
+  --rf-surface: rgba(255, 255, 255, 0.92);
+  --rf-surface-elevated: #ffffff;
+  --rf-surface-hover: #f1f5f9;
+  --rf-border: rgba(15, 23, 42, 0.12);
+  --rf-text: #0f172a;
+  --rf-text-muted: #475569;
+  --rf-accent: #2563eb;
+  --rf-accent-fg: #ffffff;
+  --rf-accent-soft: rgba(37, 99, 235, 0.12);
+  --rf-ink-default: #0f172a;
+}
+
+.dark {
+  --rf-canvas-bg: #101319;
+  --rf-grid: rgba(148, 163, 184, 0.1);
+  --rf-surface: rgba(22, 27, 36, 0.92);
+  --rf-surface-elevated: #1b212d;
+  --rf-surface-hover: #252d3d;
+  --rf-border: rgba(148, 163, 184, 0.16);
+  --rf-text: #f1f5f9;
+  --rf-text-muted: #94a3b8;
+  --rf-accent: #3b82f6;
+  --rf-accent-fg: #ffffff;
+  --rf-accent-soft: rgba(59, 130, 246, 0.18);
+  --rf-ink-default: #f1f5f9;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: var(--rf-canvas-bg);
+  color: var(--rf-text);
+}
+
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.rf-side-panel-transition {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease;
+  will-change: transform, opacity;
+}
+
+@media (max-width: 767px) {
+  button,
+  [role="button"] {
+    touch-action: manipulation;
+  }
+}
+
+.font-mono-tabular {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.rf-panel {
+  background-color: var(--rf-surface);
+  border: 1px solid var(--rf-border);
+  backdrop-filter: var(--rf-blur, blur(14px));
+  -webkit-backdrop-filter: var(--rf-blur, blur(14px));
+  box-shadow: var(--rf-panel-highlight, inset 0 1px 0 rgba(255, 255, 255, 0.04)),
+    var(--rf-panel-shadow, 0 10px 30px -10px rgba(0, 0, 0, 0.25));
+}
+
+.rf-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.rf-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.rf-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--rf-border);
+  border-radius: 999px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

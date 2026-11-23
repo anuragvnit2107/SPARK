@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix SPARK - ENGINEERED",
+  "description": "An open-source, end-to-end encrypted collaborative hand-drawn whiteboard and engineering schematic workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
