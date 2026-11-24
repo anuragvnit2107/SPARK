@@ -29,10 +29,10 @@ export interface Translations {
     mathEngine: string;
     collaborate: string;
     export: string;
+    exportCanvas: string;
     present: string;
     themes: string;
     fonts: string;
-    rustCore: string;
     commands: string;
     zenMode: string;
     exitZen: string;
@@ -102,10 +102,10 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       mathEngine: 'Math',
       collaborate: 'Collaborate',
       export: 'Export',
+      exportCanvas: 'Export Canvas',
       present: 'Present',
       themes: 'Themes',
       fonts: 'Typography',
-      rustCore: 'Rust Core',
       commands: 'Command Palette',
       zenMode: 'Zen Mode',
       exitZen: 'Exit Zen',
@@ -113,7 +113,7 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       shapeSnapToggle: 'Shape Recognition',
       clearCanvas: 'Clear Canvas',
       loadDemo: 'Load Demo Circuit',
-      importFile: 'Open .excalidraw / .json',
+      importFile: 'Open File',
       language: 'Language',
     },
     inspector: {
@@ -165,10 +165,10 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       mathEngine: 'Mates',
       collaborate: 'Colaborar',
       export: 'Exportar',
+      exportCanvas: 'Exportar lienzo',
       present: 'Presentar',
       themes: 'Temas',
       fonts: 'Tipografía',
-      rustCore: 'Núcleo Rust',
       commands: 'Paleta de Comandos',
       zenMode: 'Modo Zen',
       exitZen: 'Salir de Zen',
@@ -176,7 +176,7 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       shapeSnapToggle: 'Reconocer Formas',
       clearCanvas: 'Limpiar Lienzo',
       loadDemo: 'Cargar Circuito Demo',
-      importFile: 'Abrir .excalidraw / .json',
+      importFile: 'Abrir archivo',
       language: 'Idioma',
     },
     inspector: {
@@ -228,10 +228,10 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       mathEngine: 'Maths',
       collaborate: 'Collaborer',
       export: 'Exporter',
+      exportCanvas: 'Exporter le canevas',
       present: 'Présenter',
       themes: 'Thèmes',
       fonts: 'Typographie',
-      rustCore: 'Cœur Rust',
       commands: 'Palette de Commandes',
       zenMode: 'Mode Zen',
       exitZen: 'Quitter Zen',
@@ -239,7 +239,7 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       shapeSnapToggle: 'Reconnaissance',
       clearCanvas: 'Effacer',
       loadDemo: 'Charger Circuit Démo',
-      importFile: 'Ouvrir .excalidraw / .json',
+      importFile: 'Ouvrir un fichier',
       language: 'Langue',
     },
     inspector: {
@@ -291,10 +291,10 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       mathEngine: 'Mathe',
       collaborate: 'Zusammenarbeit',
       export: 'Exportieren',
+      exportCanvas: 'Leinwand exportieren',
       present: 'Präsentieren',
       themes: 'Themen',
       fonts: 'Typografie',
-      rustCore: 'Rust-Kern',
       commands: 'Befehlspalette',
       zenMode: 'Zen-Modus',
       exitZen: 'Zen beenden',
@@ -302,7 +302,7 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       shapeSnapToggle: 'Formerkennung',
       clearCanvas: 'Leinwand leeren',
       loadDemo: 'Demo-Schaltung laden',
-      importFile: '.excalidraw / .json öffnen',
+      importFile: 'Datei öffnen',
       language: 'Sprache',
     },
     inspector: {
@@ -354,10 +354,10 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       mathEngine: '数学',
       collaborate: '共同編集',
       export: 'エクスポート',
+      exportCanvas: 'キャンバスを書き出す',
       present: 'プレゼン',
       themes: 'テーマ',
       fonts: 'タイポグラフィ',
-      rustCore: 'Rustコア',
       commands: 'コマンド',
       zenMode: 'Zenモード',
       exitZen: 'Zen終了',
@@ -365,7 +365,7 @@ export const TRANSLATIONS: Record<Locale, Translations> = {
       shapeSnapToggle: '図形認識',
       clearCanvas: 'クリア',
       loadDemo: 'デモ回路読込',
-      importFile: '.excalidraw / .json 開く',
+      importFile: 'ファイルを開く',
       language: '言語',
     },
     inspector: {

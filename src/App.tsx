@@ -4,7 +4,7 @@ import {
   Cpu,
   Download,
   Eye,
-  Lock,
+  LayoutGrid,
   Maximize2,
   Presentation,
   Redo2,
@@ -15,6 +15,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
+import { User, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
 import {
   CameraState,
   CanvasThemeId,
@@ -50,14 +51,7 @@ import {
 import { CIRCUIT_CATALOG } from './engineeringComponents';
 import { getNormalizedBounds, rotateElementBy, updateBoundConnectors } from './sketchEngine';
 import { importSceneFromJson } from './exporters';
-import {
-  decryptJson,
-  encryptJson,
-  generateEncryptionKey,
-  generateRoomId,
-  importEncryptionKey,
-  parseRoomHash,
-} from './crypto';
+import { auth, googleProvider } from './firebase';
 import { Canvas } from './components/Canvas';
 import { Toolbar } from './components/Toolbar';
 import { PropertiesPanel } from './components/PropertiesPanel';
@@ -68,6 +62,7 @@ import { PresentationController } from './components/PresentationController';
 import { ExportModal } from './components/ExportModal';
 import { ThemeModal } from './components/ThemeModal';
 import { CollabModal } from './components/CollabModal';
+import { UserProfileControl } from './components/UserProfileControl';
 import { CommandItem, CommandPalette } from './components/CommandPalette';
 import { FontShowcaseModal } from './components/FontShowcaseModal';
 import { RustCodeViewerModal } from './components/RustCodeViewerModal';
@@ -89,6 +84,10 @@ import {
   saveHubCanvases,
 } from './hub/canvasHubStore';
 import { renderBoardThumbnailDataUrl } from './hub/boardTextureRenderer';
+import {
+  CanvasZoomOutFloorState,
+  evaluateCanvasZoomOutExit,
+} from './hub/hubZoomTransition';
 import { CodeRunnerBar } from './components/CodeRunnerBar';
 import { CODE_LANGUAGE_LABELS, CodeLanguage, CodeRunResult, detectCodeLanguage } from './codeRunner';
 import { evaluateDigitalCircuit, isLetterLogicInput, isLogicGateKind } from './digitalLogic';
@@ -111,6 +110,32 @@ import {
 } from './math/AlgebraEngine';
 import { differentiateSymbolic, integrateIndefinite } from './math/CalculusEngine';
 import { canonicalToLatex, normalizeUnicodeToCanonical } from './math/SymbolConverter';
+import {
+  buildImageWhiteboardElement,
+  computeFittedImagePlacement,
+  extractClipboardImageFiles,
+  isEditablePasteTarget,
+} from './utils/imagePaste';
+import { compressImageFileToDataUrl } from './utils/imageCompression';
+import {
+  buildFirestoreBoardFields,
+  checkBoardPayloadWithinFirestoreLimit,
+  createDebouncedTask,
+  isValidBoardId,
+} from './services/firestoreBoardMappers';
+import {
+  addCollaboratorUidInFirestore,
+  createBoardInFirestore,
+  deleteBoardFromFirestore,
+  joinSharedBoardInFirestore,
+  publishPresenceCursor,
+  removePresenceCursor,
+  saveBoardToFirestore,
+  setBoardSharingInFirestore,
+  subscribeBoardDoc,
+  subscribeBoardPresence,
+  subscribeUserBoards,
+} from './services/firestoreBoards';
 
 const STORAGE_SCENE_KEY = 'rustly-forge-scene-v1';
 const STORAGE_PREFS_KEY = 'rustly-forge-prefs-v1';
@@ -173,24 +198,32 @@ function loadInitialElements(): WhiteboardElement[] {
 
 type AppRoute = 'splash' | 'hub' | 'canvas';
 
-function parseLocationRoute(): { route: AppRoute; canvasId: string | null } {
+function parseLocationRoute(): {
+  route: AppRoute;
+  canvasId: string | null;
+  pendingJoinBoardId: string | null;
+} {
   try {
     const params = new URLSearchParams(window.location.search);
+    const boardParam = params.get('board');
+    if (isValidBoardId(boardParam)) {
+      return { route: 'canvas', canvasId: boardParam, pendingJoinBoardId: boardParam };
+    }
     if (params.get('autostart') === '1') {
-      return { route: 'canvas', canvasId: null };
+      return { route: 'canvas', canvasId: null, pendingJoinBoardId: null };
     }
     const path = window.location.pathname.replace(/\/+$/, '') || '/';
     if (path === '/hub') {
-      return { route: 'hub', canvasId: null };
+      return { route: 'hub', canvasId: null, pendingJoinBoardId: null };
     }
     if (path.startsWith('/canvas/')) {
       const id = decodeURIComponent(path.slice('/canvas/'.length));
-      if (id) return { route: 'canvas', canvasId: id };
+      if (id) return { route: 'canvas', canvasId: id, pendingJoinBoardId: null };
     }
   } catch {
     // Fallback to splash
   }
-  return { route: 'splash', canvasId: null };
+  return { route: 'splash', canvasId: null, pendingJoinBoardId: null };
 }
 
 export default function App() {
@@ -223,6 +256,7 @@ export default function App() {
       hubCanvases: loadedHub,
       route: parsedRoute.route,
       activeId: activeRec?.id || null,
+      pendingJoinBoardId: parsedRoute.pendingJoinBoardId,
       initialElements: activeRec ? activeRec.elements : legacy,
       initialCamera: activeRec ? activeRec.camera : { x: 0, y: 0, zoom: 1 },
     };
@@ -265,6 +299,27 @@ export default function App() {
   // Drawers & Modals
   const showOpeningScreen = appRoute === 'splash';
   const showCanvasHub = appRoute === 'hub';
+  const [hasVisitedHub, setHasVisitedHub] = useState<boolean>(initialBoot.route === 'hub');
+  const [hubReturnCanvasId, setHubReturnCanvasId] = useState<string | null>(null);
+  const cameraRef = useRef<CameraState>(camera);
+  cameraRef.current = camera;
+  const elementsRef = useRef<WhiteboardElement[]>(elements);
+  elementsRef.current = elements;
+  const lastCursorWorldRef = useRef<Point | null>(null);
+  const appRouteRef = useRef<AppRoute>(appRoute);
+  appRouteRef.current = appRoute;
+  const preparedCanvasIdRef = useRef<string | null>(null);
+  const zoomOutFloorRef = useRef<CanvasZoomOutFloorState>({
+    floorHitCount: 0,
+    lastHitAt: 0,
+  });
+
+  useEffect(() => {
+    if (appRoute === 'hub') {
+      setHasVisitedHub(true);
+    }
+    zoomOutFloorRef.current = { floorHitCount: 0, lastHitAt: 0 };
+  }, [appRoute]);
   const [circuitsOpen, setCircuitsOpen] = useState(false);
   const [simPanelOpen, setSimPanelOpen] = useState(false);
   const [mathOpen, setMathOpen] = useState(false);
@@ -338,16 +393,33 @@ export default function App() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const sceneFileInputRef = useRef<HTMLInputElement>(null);
 
-  // E2EE Collaboration State
+  // Firebase Auth & Cloud Sync State
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [cloudSyncState, setCloudSyncState] = useState<'guest' | 'synced' | 'syncing' | 'error'>(
+    'guest'
+  );
+  const authUserRef = useRef<User | null>(null);
+  authUserRef.current = authUser;
+  const hubCanvasesRef = useRef<SpatialCanvasRecord[]>(hubCanvases);
+  hubCanvasesRef.current = hubCanvases;
+  const activeCanvasIdRef = useRef<string | null>(activeCanvasId);
+  activeCanvasIdRef.current = activeCanvasId;
+  const canvasThemeIdRef = useRef<CanvasThemeId>(canvasThemeId);
+  canvasThemeIdRef.current = canvasThemeId;
+  const pendingJoinBoardIdRef = useRef<string | null>(initialBoot.pendingJoinBoardId);
+  const seededUidRef = useRef<string | null>(null);
+  const lastSavedElementsJsonRef = useRef<string>('');
+  const lastSeenRemoteElementsJsonRef = useRef<string>('');
+  const lastLocalStrokeAtRef = useRef<number>(0);
+  const lastCursorSentRef = useRef<number>(0);
+  const lastCursorPointSentRef = useRef<Point | null>(null);
+  const boardSyncDebouncerRef = useRef(createDebouncedTask(450));
+
   const peerIdRef = useRef<string>(`peer_${Math.random().toString(36).slice(2, 9)}`);
   const peerColorRef = useRef<string>(
     PEER_COLORS[Math.floor(Math.random() * PEER_COLORS.length)]
   );
-  const cryptoKeyRef = useRef<CryptoKey | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const isRemoteUpdateRef = useRef(false);
-  const sceneVersionRef = useRef(1);
-  const lastCursorSentRef = useRef(0);
 
   const [collab, setCollab] = useState<CollabStatus>({
     connected: false,
@@ -361,7 +433,7 @@ export default function App() {
 
   const showToast = useCallback((msg: string) => {
     setToastMsg(msg);
-    setTimeout(() => setToastMsg((curr) => (curr === msg ? null : curr)), 2600);
+    setTimeout(() => setToastMsg((curr) => (curr === msg ? null : curr)), 2800);
   }, []);
 
   // Apply theme CSS variables and sync default ink
@@ -389,6 +461,57 @@ export default function App() {
   useEffect(() => {
     saveActiveCanvasId(activeCanvasId);
   }, [activeCanvasId]);
+
+  const persistBoardToCloud = useCallback(
+    async (record: SpatialCanvasRecord) => {
+      const user = authUserRef.current;
+      if (!user) return;
+      setCloudSyncState('syncing');
+      try {
+        lastSavedElementsJsonRef.current = JSON.stringify(record.elements);
+        const res = await saveBoardToFirestore(record, user.uid);
+        if (!res.ok) {
+          setCloudSyncState('error');
+          if (res.reason === 'payload_too_large') {
+            showToast('Image too large for cloud sync—compressed or keep local');
+          }
+          return;
+        }
+        setCloudSyncState('synced');
+      } catch (err) {
+        setCloudSyncState('error');
+        console.error('Failed to save board to Firestore:', err);
+      }
+    },
+    [showToast]
+  );
+
+  const buildCurrentActiveBoardRecord = useCallback(
+    (
+      nextEls: WhiteboardElement[] = elementsRef.current,
+      nextCam: CameraState = cameraRef.current,
+      targetId: string | null = activeCanvasIdRef.current,
+      nextCanvasThemeId: CanvasThemeId = canvasThemeIdRef.current
+    ): SpatialCanvasRecord | null => {
+      if (!targetId) return null;
+      const existing = hubCanvasesRef.current.find((c) => c.id === targetId);
+      if (!existing) return null;
+      const w = typeof window !== 'undefined' ? window.innerWidth : 1280;
+      const h = typeof window !== 'undefined' ? window.innerHeight : 800;
+      const snapshot = extractLastViewport(nextEls, nextCam, w, h);
+      const count = nextEls.filter((el) => !el.isDeleted).length;
+      return {
+        ...existing,
+        canvasThemeId: nextCanvasThemeId,
+        elements: nextEls,
+        elementCount: count,
+        camera: nextCam,
+        updatedAt: Date.now(),
+        lastViewport: snapshot,
+      };
+    },
+    []
+  );
 
   const syncActiveCanvasIntoHub = useCallback(
     (
@@ -441,7 +564,7 @@ export default function App() {
             : nextRoute === 'hub'
               ? '/hub'
               : `/canvas/${encodeURIComponent(canvasId || activeCanvasId || 'workspace')}`;
-        if (window.location.pathname !== nextUrl) {
+        if (window.location.pathname !== nextUrl || window.location.search.includes('board=')) {
           window.history.pushState({ route: nextRoute, canvasId }, '', nextUrl);
         }
       } catch {
@@ -451,10 +574,12 @@ export default function App() {
     [activeCanvasId]
   );
 
-  const handleOpenCanvasFromHub = useCallback(
-    (canvasId: string) => {
-      const target = hubCanvases.find((c) => c.id === canvasId);
-      if (!target) return;
+  const loadCanvasIntoWorkspace = useCallback(
+    (canvasId: string, overrideRecord?: SpatialCanvasRecord): SpatialCanvasRecord | null => {
+      const target = overrideRecord || hubCanvasesRef.current.find((c) => c.id === canvasId);
+      if (!target) return null;
+      lastSavedElementsJsonRef.current = JSON.stringify(target.elements);
+      lastSeenRemoteElementsJsonRef.current = lastSavedElementsJsonRef.current;
       setActiveCanvasId(target.id);
       setElements(target.elements);
       setCamera(target.camera || { x: 0, y: 0, zoom: 1 });
@@ -471,15 +596,42 @@ export default function App() {
       historyIdxRef.current = 0;
       setCanUndo(false);
       setCanRedo(false);
+      preparedCanvasIdRef.current = target.id;
+      return target;
+    },
+    []
+  );
+
+  const handlePrepareCanvasFromHub = useCallback(
+    (canvasId: string) => {
+      loadCanvasIntoWorkspace(canvasId);
+    },
+    [loadCanvasIntoWorkspace]
+  );
+
+  const handleOpenCanvasFromHub = useCallback(
+    (canvasId: string) => {
+      const target = hubCanvasesRef.current.find((c) => c.id === canvasId);
+      if (!target) return;
+      if (preparedCanvasIdRef.current !== canvasId) {
+        loadCanvasIntoWorkspace(canvasId);
+      }
+      preparedCanvasIdRef.current = null;
+      setHubReturnCanvasId(null);
       navigateRoute('canvas', target.id);
     },
-    [hubCanvases, navigateRoute]
+    [loadCanvasIntoWorkspace, navigateRoute]
   );
 
   const handleOpenHubFromWorkspace = useCallback(() => {
     if (appRoute === 'canvas' && activeCanvasId) {
+      boardSyncDebouncerRef.current.flush();
       syncActiveCanvasIntoHub(elements, camera, activeCanvasId, canvasThemeId);
+      setHubReturnCanvasId(activeCanvasId);
+    } else {
+      setHubReturnCanvasId(null);
     }
+    preparedCanvasIdRef.current = null;
     setCircuitsOpen(false);
     setMathOpen(false);
     setSimPanelOpen(false);
@@ -492,38 +644,87 @@ export default function App() {
       category: CanvasCategory = 'Architecture',
       options?: { canvasThemeId?: CanvasThemeId; spatialPosition?: SpatialPosition }
     ) => {
-      const created = createBlankSpatialCanvas('Untitled Canvas', category, options);
+      const uid = authUserRef.current?.uid;
+      const created = createBlankSpatialCanvas('Untitled Canvas', category, {
+        ...options,
+        ownerId: uid,
+        collaborators: [],
+        shareEnabled: false,
+      });
       setHubCanvases((prev) => [created, ...prev]);
+      if (uid) {
+        void createBoardInFirestore(created, uid).catch((err) => {
+          console.error('Create cloud board failed:', err);
+        });
+      }
       return created;
     },
     []
   );
 
-  const handleRenameHubCanvas = useCallback((canvasId: string, nextTitle: string) => {
-    const clean = nextTitle.trim();
-    if (!clean) return;
-    setHubCanvases((prev) =>
-      prev.map((rec) => (rec.id === canvasId ? { ...rec, title: clean, updatedAt: Date.now() } : rec))
-    );
-  }, []);
+  const handleRenameHubCanvas = useCallback(
+    (canvasId: string, nextTitle: string) => {
+      const clean = nextTitle.trim();
+      if (!clean) return;
+      const now = Date.now();
+      let updatedRec: SpatialCanvasRecord | null = null;
+      setHubCanvases((prev) =>
+        prev.map((rec) => {
+          if (rec.id !== canvasId) return rec;
+          updatedRec = { ...rec, title: clean, updatedAt: now };
+          return updatedRec;
+        })
+      );
+      if (authUserRef.current) {
+        const target =
+          updatedRec || hubCanvasesRef.current.find((rec) => rec.id === canvasId);
+        if (target) {
+          void persistBoardToCloud({ ...target, title: clean, updatedAt: now });
+        }
+      }
+    },
+    [persistBoardToCloud]
+  );
 
   const handleUpdateCanvasPosition = useCallback(
     (canvasId: string, spatialPosition: SpatialPosition) => {
+      let updatedRec: SpatialCanvasRecord | null = null;
       setHubCanvases((prev) =>
-        prev.map((rec) =>
-          rec.id === canvasId ? { ...rec, spatialPosition } : rec
-        )
+        prev.map((rec) => {
+          if (rec.id !== canvasId) return rec;
+          updatedRec = { ...rec, spatialPosition };
+          return updatedRec;
+        })
       );
+      if (authUserRef.current) {
+        const target =
+          updatedRec || hubCanvasesRef.current.find((rec) => rec.id === canvasId);
+        if (target && (!target.ownerId || target.ownerId === authUserRef.current.uid)) {
+          void persistBoardToCloud({ ...target, spatialPosition });
+        }
+      }
     },
-    []
+    [persistBoardToCloud]
   );
 
   const handleAutoArrangeCanvases = useCallback(() => {
-    setHubCanvases((prev) => reArrangeUnpinnedCanvases(prev, Date.now()));
+    setHubCanvases((prev) => {
+      const arranged = reArrangeUnpinnedCanvases(prev, Date.now());
+      const uid = authUserRef.current?.uid;
+      if (uid) {
+        for (const rec of arranged) {
+          if (!rec.spatialPosition?.pinned && (!rec.ownerId || rec.ownerId === uid)) {
+            void saveBoardToFirestore(rec, uid).catch(() => {});
+          }
+        }
+      }
+      return arranged;
+    });
   }, []);
 
   const handleDeleteHubCanvas = useCallback(
     (canvasId: string) => {
+      const target = hubCanvasesRef.current.find((rec) => rec.id === canvasId);
       setHubCanvases((prev) => {
         if (prev.length <= 1) return prev;
         const filtered = prev.filter((rec) => rec.id !== canvasId);
@@ -537,6 +738,11 @@ export default function App() {
         }
         return filtered;
       });
+      if (authUserRef.current && (!target?.ownerId || target.ownerId === authUserRef.current.uid)) {
+        void deleteBoardFromFirestore(canvasId).catch((err) => {
+          console.error('Delete cloud board failed:', err);
+        });
+      }
     },
     [activeCanvasId]
   );
@@ -558,12 +764,17 @@ export default function App() {
           historyRef.current = [match.elements];
           historyIdxRef.current = 0;
         }
+        setHubReturnCanvasId(null);
+      } else if (parsed.route === 'hub' && appRouteRef.current === 'canvas') {
+        setHubReturnCanvasId(activeCanvasId);
+      } else {
+        setHubReturnCanvasId(null);
       }
       setAppRoute(parsed.route);
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, [hubCanvases]);
+  }, [activeCanvasId, hubCanvases]);
 
   useEffect(() => {
     try {
@@ -581,29 +792,36 @@ export default function App() {
     setCanRedo(historyIdxRef.current < historyRef.current.length - 1);
   }, []);
 
-  const broadcastEncryptedScene = useCallback(async (nextElements: WhiteboardElement[]) => {
-    const ws = wsRef.current;
-    const key = cryptoKeyRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || !key || !collab.roomId) return;
-    try {
-      sceneVersionRef.current += 1;
-      const envelope = await encryptJson({ elements: nextElements }, key);
-      ws.send(
-        JSON.stringify({
-          type: 'scene:update',
-          roomId: collab.roomId,
-          peerId: peerIdRef.current,
-          version: sceneVersionRef.current,
-          envelope,
-        })
-      );
-    } catch {
-      // Ignore transient encryption/socket errors
-    }
-  }, [collab.roomId]);
+  const scheduleCloudBoardSave = useCallback(
+    (
+      nextElements: WhiteboardElement[],
+      flushImmediately: boolean,
+      targetIdOverride?: string | null
+    ) => {
+      if (!authUserRef.current) return;
+      const targetId = targetIdOverride || activeCanvasIdRef.current;
+      if (!targetId) return;
+      boardSyncDebouncerRef.current.schedule(() => {
+        const record = buildCurrentActiveBoardRecord(
+          nextElements,
+          cameraRef.current,
+          targetId,
+          canvasThemeIdRef.current
+        );
+        if (record) {
+          return persistBoardToCloud(record);
+        }
+      });
+      if (flushImmediately) {
+        boardSyncDebouncerRef.current.flush();
+      }
+    },
+    [buildCurrentActiveBoardRecord, persistBoardToCloud]
+  );
 
   const handleElementsChange = useCallback(
     (next: WhiteboardElement[], commitHistory = true) => {
+      lastLocalStrokeAtRef.current = Date.now();
       setElements(next);
       if (commitHistory) {
         const sliced = historyRef.current.slice(0, historyIdxRef.current + 1);
@@ -613,184 +831,328 @@ export default function App() {
         historyIdxRef.current = sliced.length - 1;
         syncHistoryFlags();
       }
-      if (!isRemoteUpdateRef.current) {
-        void broadcastEncryptedScene(next);
-      }
+      scheduleCloudBoardSave(next, commitHistory);
     },
-    [broadcastEncryptedScene, syncHistoryFlags]
+    [scheduleCloudBoardSave, syncHistoryFlags]
   );
 
   const handleUndo = useCallback(() => {
     if (historyIdxRef.current <= 0) return;
     historyIdxRef.current -= 1;
     const prev = historyRef.current[historyIdxRef.current];
+    lastLocalStrokeAtRef.current = Date.now();
     setElements(prev);
     setSelectedIds([]);
     syncHistoryFlags();
-    void broadcastEncryptedScene(prev);
-  }, [broadcastEncryptedScene, syncHistoryFlags]);
+    scheduleCloudBoardSave(prev, true);
+  }, [scheduleCloudBoardSave, syncHistoryFlags]);
 
   const handleRedo = useCallback(() => {
     if (historyIdxRef.current >= historyRef.current.length - 1) return;
     historyIdxRef.current += 1;
     const next = historyRef.current[historyIdxRef.current];
+    lastLocalStrokeAtRef.current = Date.now();
     setElements(next);
     setSelectedIds([]);
     syncHistoryFlags();
-    void broadcastEncryptedScene(next);
-  }, [broadcastEncryptedScene, syncHistoryFlags]);
+    scheduleCloudBoardSave(next, true);
+  }, [scheduleCloudBoardSave, syncHistoryFlags]);
 
-  // Connect to E2EE WebSocket room
-  const connectToRoom = useCallback(
-    async (roomId: string, keyString: string, peerNameOverride?: string) => {
-      try {
-        const key = await importEncryptionKey(keyString);
-        cryptoKeyRef.current = key;
-        if (wsRef.current) {
-          wsRef.current.close();
-          wsRef.current = null;
-        }
-
-        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
-        wsRef.current = ws;
-
-        setCollab((prev) => ({
-          ...prev,
-          roomId,
-          keyString,
-          peerName: peerNameOverride || prev.peerName,
-          connected: false,
-        }));
-
-        ws.onopen = () => {
-          setCollab((prev) => ({ ...prev, connected: true }));
-          ws.send(
-            JSON.stringify({
-              type: 'join',
-              roomId,
-              peerId: peerIdRef.current,
-            })
-          );
-          // Push current local scene if room was just created
-          void broadcastEncryptedScene(elements);
-        };
-
-        ws.onmessage = async (event) => {
-          try {
-            const msg = JSON.parse(event.data);
-            if ((msg.type === 'room:init' || msg.type === 'scene:update') && msg.envelope) {
-              if (msg.peerId === peerIdRef.current) return;
-              const decrypted = await decryptJson<{ elements: WhiteboardElement[] }>(
-                msg.envelope,
-                key
-              );
-              if (Array.isArray(decrypted.elements)) {
-                isRemoteUpdateRef.current = true;
-                setElements(decrypted.elements);
-                isRemoteUpdateRef.current = false;
-              }
-            } else if (msg.type === 'cursor:update' && msg.envelope && msg.peerId !== peerIdRef.current) {
-              const cursor = await decryptJson<RemoteCursorPayload>(msg.envelope, key);
-              setCollab((prev) => ({
-                ...prev,
-                peers: {
-                  ...prev.peers,
-                  [cursor.peerId]: cursor,
-                },
-              }));
-            } else if (msg.type === 'peer:left' && msg.peerId) {
-              setCollab((prev) => {
-                const nextPeers = { ...prev.peers };
-                delete nextPeers[msg.peerId];
-                return { ...prev, peers: nextPeers };
-              });
-            }
-          } catch {
-            // Ignore undecryptable or malformed frames
-          }
-        };
-
-        ws.onclose = () => {
-          setCollab((prev) => ({ ...prev, connected: false }));
-        };
-      } catch {
-        showToast('Failed to initialize room encryption key');
+  const handleGoogleSignIn = useCallback(async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+      showToast('Signed in with Google');
+    } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        return;
       }
+      showToast('Google sign-in failed. Allow popups and try again.');
+    }
+  }, [showToast]);
+
+  const handleGoogleSignOut = useCallback(async () => {
+    boardSyncDebouncerRef.current.flush();
+    const uid = authUserRef.current?.uid;
+    const boardId = activeCanvasIdRef.current;
+    if (uid && boardId) {
+      void removePresenceCursor(boardId, uid);
+    }
+    try {
+      await signOut(auth);
+      setCollab((prev) => ({
+        ...prev,
+        connected: false,
+        roomId: null,
+        peers: {},
+      }));
+      setCloudSyncState('guest');
+      showToast('Switched to local Guest mode');
+    } catch {
+      showToast('Could not sign out cleanly');
+    }
+  }, [showToast]);
+
+  const handleJoinBoardById = useCallback(
+    async (boardId: string) => {
+      const user = authUserRef.current;
+      if (!user) {
+        pendingJoinBoardIdRef.current = boardId;
+        setCollabModalOpen(true);
+        showToast('Sign in with Google to join the shared board');
+        return;
+      }
+      const joinedBoard = await joinSharedBoardInFirestore(boardId, user.uid);
+      setHubCanvases((prev) => {
+        const exists = prev.some((c) => c.id === joinedBoard.id);
+        return exists
+          ? prev.map((c) => (c.id === joinedBoard.id ? joinedBoard : c))
+          : [joinedBoard, ...prev];
+      });
+      loadCanvasIntoWorkspace(joinedBoard.id, joinedBoard);
+      navigateRoute('canvas', joinedBoard.id);
+      showToast(`Joined live board "${joinedBoard.title}"`);
     },
-    [broadcastEncryptedScene, elements, showToast]
+    [loadCanvasIntoWorkspace, navigateRoute, showToast]
   );
 
-  // Auto-join if URL contains #room=<id>,<key>
-  useEffect(() => {
-    const checkHash = () => {
-      const parsed = parseRoomHash(window.location.hash);
-      if (parsed && parsed.roomId !== collab.roomId) {
-        void connectToRoom(parsed.roomId, parsed.keyString);
-        showToast('Joined end-to-end encrypted room');
+  const handleToggleBoardSharing = useCallback(
+    async (enabled: boolean) => {
+      const user = authUserRef.current;
+      const boardId = activeCanvasIdRef.current;
+      if (!user || !boardId) return;
+      const currentRecord = hubCanvasesRef.current.find((c) => c.id === boardId);
+      if (currentRecord && !currentRecord.ownerId) {
+        await persistBoardToCloud({ ...currentRecord, ownerId: user.uid, shareEnabled: enabled });
+      } else {
+        await setBoardSharingInFirestore(boardId, enabled);
       }
-    };
-    checkHash();
-    window.addEventListener('hashchange', checkHash);
-    return () => window.removeEventListener('hashchange', checkHash);
-  }, [collab.roomId, connectToRoom, showToast]);
+      setHubCanvases((prev) =>
+        prev.map((c) => (c.id === boardId ? { ...c, shareEnabled: enabled } : c))
+      );
+      showToast(enabled ? 'Share link enabled for this board' : 'Board link sharing disabled');
+    },
+    [persistBoardToCloud, showToast]
+  );
 
-  const handleStartCollabSession = async (peerName: string) => {
-    const roomId = generateRoomId();
-    const { keyString } = await generateEncryptionKey();
-    window.history.replaceState(null, '', `/#room=${roomId},${keyString}`);
-    await connectToRoom(roomId, keyString, peerName);
-    showToast('E2EE session live');
-  };
+  const handleAddCollaboratorUid = useCallback(
+    async (collaboratorUid: string) => {
+      const boardId = activeCanvasIdRef.current;
+      if (!authUserRef.current || !boardId) return;
+      await addCollaboratorUidInFirestore(boardId, collaboratorUid);
+      setHubCanvases((prev) =>
+        prev.map((c) =>
+          c.id === boardId
+            ? {
+                ...c,
+                collaborators: Array.from(new Set([...(c.collaborators || []), collaboratorUid])),
+              }
+            : c
+        )
+      );
+      showToast('Added collaborator to board');
+    },
+    [showToast]
+  );
 
-  const handleStopCollabSession = () => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
+  // Firebase Auth listener
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (user) => {
+      setAuthUser(user);
+      setAuthLoading(false);
+      if (user) {
+        setCollab((prev) => ({
+          ...prev,
+          peerId: user.uid,
+          peerName: user.displayName || user.email || 'Engineer',
+        }));
+      } else {
+        setCloudSyncState('guest');
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // Prompt guest users opening a ?board= share link
+  useEffect(() => {
+    if (!authLoading && !authUser && pendingJoinBoardIdRef.current) {
+      setCollabModalOpen(true);
+      showToast('Sign in with Google to open the shared board');
     }
-    cryptoKeyRef.current = null;
-    window.history.replaceState(null, '', '/');
-    setCollab((prev) => ({
-      ...prev,
-      connected: false,
-      roomId: null,
-      keyString: null,
-      peers: {},
-    }));
-  };
+  }, [authLoading, authUser, showToast]);
+
+  // Subscribe to signed-in user's owned & shared Firestore boards
+  useEffect(() => {
+    if (!authUser) return;
+    setCloudSyncState('synced');
+
+    const unsubBoards = subscribeUserBoards(
+      authUser.uid,
+      (cloudBoards, hasInitialOwnedSnapshot) => {
+        if (
+          hasInitialOwnedSnapshot &&
+          cloudBoards.length === 0 &&
+          seededUidRef.current !== authUser.uid
+        ) {
+          seededUidRef.current = authUser.uid;
+          const localBoards = hubCanvasesRef.current;
+          for (const rec of localBoards) {
+            const fields = buildFirestoreBoardFields(rec, authUser.uid);
+            if (checkBoardPayloadWithinFirestoreLimit(fields).ok) {
+              void createBoardInFirestore({ ...rec, ownerId: authUser.uid }, authUser.uid).catch(
+                () => {}
+              );
+            }
+          }
+          return;
+        }
+
+        if (cloudBoards.length > 0) {
+          setHubCanvases((prev) => {
+            const cloudIds = new Set(cloudBoards.map((b) => b.id));
+            // Keep any unsynced oversized local-only boards while letting cloud state lead
+            const oversizedLocalOnly = prev.filter(
+              (b) => !cloudIds.has(b.id) && !b.ownerId && !seededUidRef.current
+            );
+            return [...cloudBoards, ...oversizedLocalOnly];
+          });
+
+          const currActiveId = activeCanvasIdRef.current;
+          const activeExistsInCloud = cloudBoards.some((b) => b.id === currActiveId);
+          if (!activeExistsInCloud && !pendingJoinBoardIdRef.current && cloudBoards[0]) {
+            loadCanvasIntoWorkspace(cloudBoards[0].id, cloudBoards[0]);
+          }
+        }
+      },
+      (err) => {
+        setCloudSyncState('error');
+        console.error('Cloud workspace sync error:', err);
+      }
+    );
+
+    if (pendingJoinBoardIdRef.current) {
+      const targetId = pendingJoinBoardIdRef.current;
+      pendingJoinBoardIdRef.current = null;
+      void handleJoinBoardById(targetId).catch((err) => {
+        showToast(
+          err instanceof Error ? err.message : 'Unable to join shared board'
+        );
+      });
+    }
+
+    return () => unsubBoards();
+  }, [authUser, handleJoinBoardById, loadCanvasIntoWorkspace, showToast]);
+
+  // Subscribe to real-time board document updates & collaborator cursors (onSnapshot)
+  useEffect(() => {
+    if (!authUser || !activeCanvasId || appRoute !== 'canvas') {
+      setCollab((prev) => ({ ...prev, connected: false, roomId: null, peers: {} }));
+      return;
+    }
+
+    const activeRec = hubCanvasesRef.current.find((c) => c.id === activeCanvasId);
+    const isCloudMember =
+      !activeRec?.ownerId ||
+      activeRec.ownerId === authUser.uid ||
+      Boolean(activeRec.collaborators?.includes(authUser.uid));
+
+    if (!isCloudMember) {
+      return;
+    }
+
+    const unsubDoc = subscribeBoardDoc(
+      activeCanvasId,
+      (remoteBoard) => {
+        if (!remoteBoard) return;
+        setHubCanvases((prev) =>
+          prev.map((c) => (c.id === remoteBoard.id ? { ...c, ...remoteBoard } : c))
+        );
+
+        const remoteJson = JSON.stringify(remoteBoard.elements);
+        if (
+          remoteJson !== lastSavedElementsJsonRef.current &&
+          remoteJson !== lastSeenRemoteElementsJsonRef.current &&
+          Date.now() - lastLocalStrokeAtRef.current > 250
+        ) {
+          lastSeenRemoteElementsJsonRef.current = remoteJson;
+          lastSavedElementsJsonRef.current = remoteJson;
+          setElements(remoteBoard.elements);
+          if (
+            remoteBoard.canvasThemeId &&
+            CANVAS_THEMES[remoteBoard.canvasThemeId]
+          ) {
+            setCanvasThemeId(remoteBoard.canvasThemeId);
+          }
+        }
+      },
+      () => {
+        // Ignore transient permission errors before initial create completes
+      }
+    );
+
+    const unsubPresence = subscribeBoardPresence(
+      activeCanvasId,
+      authUser.uid,
+      (peers) => {
+        setCollab((prev) => ({
+          ...prev,
+          connected: true,
+          roomId: activeCanvasId,
+          peers,
+        }));
+      },
+      () => {
+        setCollab((prev) => ({ ...prev, connected: false }));
+      }
+    );
+
+    const handlePageHide = () => {
+      boardSyncDebouncerRef.current.flush();
+      void removePresenceCursor(activeCanvasId, authUser.uid);
+    };
+    window.addEventListener('pagehide', handlePageHide);
+
+    return () => {
+      unsubDoc();
+      unsubPresence();
+      window.removeEventListener('pagehide', handlePageHide);
+      boardSyncDebouncerRef.current.flush();
+      void removePresenceCursor(activeCanvasId, authUser.uid);
+    };
+  }, [activeCanvasId, appRoute, authUser]);
 
   const handleCursorMove = useCallback(
     (worldPt: Point) => {
-      const ws = wsRef.current;
-      const key = cryptoKeyRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN || !key || !collab.roomId) return;
+      lastCursorWorldRef.current = worldPt;
+      const user = authUserRef.current;
+      const boardId = activeCanvasIdRef.current;
+      if (!user || !boardId || appRouteRef.current !== 'canvas') return;
+
+      const prevPt = lastCursorPointSentRef.current;
+      if (prevPt && Math.hypot(worldPt.x - prevPt.x, worldPt.y - prevPt.y) < 3) {
+        return;
+      }
       const now = Date.now();
-      if (now - lastCursorSentRef.current < 60) return;
+      if (now - lastCursorSentRef.current < 140) return;
+
       lastCursorSentRef.current = now;
-      const payload: RemoteCursorPayload = {
-        peerId: peerIdRef.current,
-        name: collab.peerName,
+      lastCursorPointSentRef.current = worldPt;
+      void publishPresenceCursor({
+        boardId,
+        uid: user.uid,
+        name: user.displayName || user.email || collab.peerName,
         color: collab.peerColor,
         x: worldPt.x,
         y: worldPt.y,
         tool: activeTool,
-        updatedAt: now,
-      };
-      void encryptJson(payload, key).then((envelope) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: 'cursor:update',
-              roomId: collab.roomId,
-              peerId: peerIdRef.current,
-              envelope,
-            })
-          );
-        }
       });
     },
-    [activeTool, collab.peerColor, collab.peerName, collab.roomId]
+    [activeTool, collab.peerColor, collab.peerName]
   );
+
+  const handleCursorLeave = useCallback(() => {
+    lastCursorWorldRef.current = null;
+  }, []);
 
   const selectedElements = useMemo(
     () => elements.filter((e) => !e.isDeleted && selectedIds.includes(e.id)),
@@ -1137,20 +1499,36 @@ export default function App() {
     handleElementsChange(next, true);
   }, [elements, handleElementsChange, selectedIds]);
 
-  const handleZoomBy = useCallback((factor: number) => {
-    setCamera((prev) => {
-      const nextZoom = Math.min(6, Math.max(0.05, prev.zoom * factor));
-      const cx = window.innerWidth / 2;
-      const cy = window.innerHeight / 2;
-      const wx = (cx - prev.x) / prev.zoom;
-      const wy = (cy - prev.y) / prev.zoom;
-      return {
-        zoom: nextZoom,
-        x: cx - wx * nextZoom,
-        y: cy - wy * nextZoom,
-      };
-    });
-  }, []);
+  const handleZoomBy = useCallback(
+    (factor: number) => {
+      if (appRoute === 'canvas') {
+        const exitRes = evaluateCanvasZoomOutExit(
+          cameraRef.current.zoom,
+          factor < 1,
+          performance.now(),
+          zoomOutFloorRef.current
+        );
+        zoomOutFloorRef.current = exitRes.nextState;
+        if (exitRes.shouldExitToHub) {
+          handleOpenHubFromWorkspace();
+          return;
+        }
+      }
+      setCamera((prev) => {
+        const nextZoom = Math.min(6, Math.max(0.05, prev.zoom * factor));
+        const cx = window.innerWidth / 2;
+        const cy = window.innerHeight / 2;
+        const wx = (cx - prev.x) / prev.zoom;
+        const wy = (cy - prev.y) / prev.zoom;
+        return {
+          zoom: nextZoom,
+          x: cx - wx * nextZoom,
+          y: cy - wy * nextZoom,
+        };
+      });
+    },
+    [appRoute, handleOpenHubFromWorkspace]
+  );
 
   const handleFitToScreen = useCallback(() => {
     const active = elements.filter((e) => !e.isDeleted);
@@ -1660,51 +2038,75 @@ export default function App() {
     [camera, defaultStyle, elements, handleElementsChange, showToast]
   );
 
-  // Image Stamping Handler
+  // Shared Image File Loader, Compression & Stamping Handler (used by Image tool & Ctrl+V paste)
+  const insertImageFiles = useCallback(
+    async (files: File[], cursorWorld?: Point | null) => {
+      if (files.length === 0) return;
+
+      const buildCompressedElement = async (
+        file: File,
+        offsetIndex: number
+      ): Promise<WhiteboardElement | null> => {
+        const compressed = await compressImageFileToDataUrl(file);
+        if (!compressed || !compressed.dataUrl) return null;
+        const placement = computeFittedImagePlacement({
+          naturalWidth: compressed.naturalWidth,
+          naturalHeight: compressed.naturalHeight,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          camera: cameraRef.current,
+          cursorWorld,
+          offsetIndex,
+        });
+        return buildImageWhiteboardElement({
+          dataUrl: compressed.dataUrl,
+          x: placement.x,
+          y: placement.y,
+          width: placement.width,
+          height: placement.height,
+          strokeColor: defaultStyle.strokeColor,
+        });
+      };
+
+      const created = (
+        await Promise.all(files.map((file, idx) => buildCompressedElement(file, idx)))
+      ).filter((el): el is WhiteboardElement => el !== null);
+
+      if (created.length === 0) {
+        showToast('Could not read pasted image');
+        return;
+      }
+
+      const nextElements = [...elementsRef.current, ...created];
+      const activeRec =
+        hubCanvasesRef.current.find((c) => c.id === activeCanvasIdRef.current) ||
+        createBlankSpatialCanvas();
+      const projectedFields = buildFirestoreBoardFields(
+        {
+          ...activeRec,
+          elements: nextElements,
+          camera: cameraRef.current,
+        },
+        authUserRef.current?.uid || 'guest'
+      );
+      const sizeCheck = checkBoardPayloadWithinFirestoreLimit(projectedFields);
+      if (!sizeCheck.ok) {
+        showToast('Image too large for cloud sync—compressed or keep local');
+      }
+
+      handleElementsChange(nextElements, true);
+      setSelectedIds(created.map((el) => el.id));
+      setPendingCircuitKind(null);
+      setActiveTool('select');
+    },
+    [defaultStyle.strokeColor, handleElementsChange, showToast]
+  );
+
   const handleImageFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = String(reader.result || '');
-      const img = new Image();
-      img.onload = () => {
-        const maxDim = 380;
-        const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
-        const w = Math.round(img.width * ratio);
-        const h = Math.round(img.height * ratio);
-        const cx = (window.innerWidth / 2 - camera.x) / camera.zoom;
-        const cy = (window.innerHeight / 2 - camera.y) / camera.zoom;
-        const imgEl: WhiteboardElement = {
-          id: `img_${Date.now().toString(36)}`,
-          type: 'image',
-          x: cx - w / 2,
-          y: cy - h / 2,
-          width: w,
-          height: h,
-          angle: 0,
-          strokeColor: defaultStyle.strokeColor,
-          backgroundColor: 'transparent',
-          fillStyle: 'none',
-          strokeWidth: 1,
-          strokeStyle: 'solid',
-          sloppiness: 0,
-          opacity: 100,
-          seed: Math.floor(Math.random() * 10000),
-          fontFamily: 'cleansans',
-          fontSize: 16,
-          imageDataUrl: dataUrl,
-          version: 1,
-          updatedAt: Date.now(),
-        };
-        handleElementsChange([...elements, imgEl], true);
-        setSelectedIds([imgEl.id]);
-        setActiveTool('select');
-      };
-      img.src = dataUrl;
-    };
-    reader.readAsDataURL(file);
+    void insertImageFiles([file], null);
   };
 
   // .excalidraw / .json Scene Importer
@@ -1735,7 +2137,7 @@ export default function App() {
   // Global Keyboard Shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (showOpeningScreen) return;
+      if (showOpeningScreen || showCanvasHub) return;
       const target = e.target as HTMLElement | null;
       const isEditingText =
         target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
@@ -1760,13 +2162,10 @@ export default function App() {
       }
 
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        if (showCanvasHub) return;
         e.preventDefault();
         setCommandOpen((o) => !o);
         return;
       }
-
-      if (showCanvasHub) return;
 
       if (isEditingText) return;
 
@@ -1858,6 +2257,50 @@ export default function App() {
     showOpeningScreen,
   ]);
 
+  // Global Clipboard Image Paste (Ctrl+V / Cmd+V) onto active 2D canvas
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      if (showOpeningScreen || showCanvasHub) return;
+      if (
+        exportOpen ||
+        themeModalOpen ||
+        collabModalOpen ||
+        commandOpen ||
+        fontModalOpen ||
+        rustModalOpen ||
+        editingWebpageId !== null
+      ) {
+        return;
+      }
+      if (
+        isEditablePasteTarget(e.target as HTMLElement | null) ||
+        isEditablePasteTarget(document.activeElement as HTMLElement | null)
+      ) {
+        return;
+      }
+
+      const imageFiles = extractClipboardImageFiles(e.clipboardData);
+      if (imageFiles.length === 0) return;
+
+      e.preventDefault();
+      void insertImageFiles(imageFiles, lastCursorWorldRef.current);
+    };
+
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [
+    collabModalOpen,
+    commandOpen,
+    editingWebpageId,
+    exportOpen,
+    fontModalOpen,
+    insertImageFiles,
+    rustModalOpen,
+    showCanvasHub,
+    showOpeningScreen,
+    themeModalOpen,
+  ]);
+
   // Global Alt+Tab canvas switcher while actively editing inside a 2D canvas
   const workspaceSwitcherRef = useRef({ open: false, index: 0 });
   workspaceSwitcherRef.current.open = workspaceSwitcherOpen;
@@ -1946,7 +2389,7 @@ export default function App() {
       },
       { id: 'export', label: 'Export PNG / SVG / .excalidraw', category: 'File', action: () => setExportOpen(true) },
       { id: 'import', label: 'Open .excalidraw or .json file', category: 'File', action: () => sceneFileInputRef.current?.click() },
-      { id: 'collab', label: 'End-to-End Encrypted Collaboration', category: 'Share', action: () => setCollabModalOpen(true) },
+      { id: 'collab', label: 'Share & Live Cloud Collaboration', category: 'Share', action: () => setCollabModalOpen(true) },
       { id: 'circuits', label: 'Toggle Circuit Components Drawer', category: 'Engineering', action: () => { setSimPanelOpen(false); setMathOpen(false); setCircuitsOpen((o) => !o); } },
       { id: 'math', label: 'Open Smart Mathematics Engine (Algebra / Calculus / 2D & 3D)', category: 'Mathematics', action: () => { setCircuitsOpen(false); setSimPanelOpen(false); setMathOpen((o) => !o); } },
       { id: 'fgen', label: 'Insert Function Generator (Sine / Triangle / Square)', category: 'Engineering', action: () => handleQuickInsertCircuit('function-generator') },
@@ -2235,24 +2678,49 @@ export default function App() {
   return (
     <div
       data-testid="rustly-forge-app"
+      data-route={appRoute}
+      data-active-canvas={activeCanvasId || ''}
       data-theme={themeId}
       data-canvas-theme={canvasThemeId}
       className="relative w-screen h-screen overflow-hidden select-none"
     >
       {showOpeningScreen && (
-        <OpeningScreen onContinue={() => navigateRoute('hub')} />
+        <OpeningScreen
+          onContinue={() => {
+            setHubReturnCanvasId(null);
+            navigateRoute('hub');
+          }}
+        />
       )}
-      {showCanvasHub && (
+      {hasVisitedHub && (
         <CanvasHub3D
           canvases={hubCanvases}
           activeCanvasId={activeCanvasId}
+          isActive={showCanvasHub}
+          returnCanvasId={hubReturnCanvasId}
+          onPrepareCanvas={handlePrepareCanvasFromHub}
+          onReturnTransitionHandled={() => setHubReturnCanvasId(null)}
           onOpenCanvas={handleOpenCanvasFromHub}
           onCreateBlankCanvas={handleCreateBlankHubCanvas}
           onRenameCanvas={handleRenameHubCanvas}
           onUpdateCanvasPosition={handleUpdateCanvasPosition}
           onAutoArrange={handleAutoArrangeCanvases}
           onDeleteCanvas={handleDeleteHubCanvas}
-          onBackToSplash={() => navigateRoute('splash')}
+          onBackToSplash={() => {
+            setHubReturnCanvasId(null);
+            navigateRoute('splash');
+          }}
+          renderHeaderProfile={(isDarkHub) => (
+            <UserProfileControl
+              user={authUser}
+              authLoading={authLoading}
+              syncState={cloudSyncState}
+              variant="hub"
+              isDarkHub={isDarkHub}
+              onSignInGoogle={handleGoogleSignIn}
+              onSignOut={handleGoogleSignOut}
+            />
+          )}
         />
       )}
 
@@ -2308,6 +2776,7 @@ export default function App() {
         onSwitchToggle={handleSwitchToggle}
         onWebpageClick={(elementId) => setEditingWebpageId(elementId)}
         onCursorMove={handleCursorMove}
+        onCursorLeave={handleCursorLeave}
         onStatusToast={showToast}
         onRotateSelected={handleRotateSelected}
         onResetRotationSelected={handleResetRotationSelected}
@@ -2326,12 +2795,13 @@ export default function App() {
         onPlotEquation2D={handlePlotEquation2D}
         onPlotEquation3D={handlePlotEquation3D}
         onQuickMathAction={handleQuickMathAction}
+        onExitToHub={handleOpenHubFromWorkspace}
       />
 
       {/* Desktop Top HUD Bar (hidden on mobile <768px where MobileWorkspaceHUD renders) */}
       {!zenMode && presentationIndex === null && (
-        <header className="hidden md:flex pointer-events-none fixed top-3 left-3 right-3 z-30 items-center justify-between gap-4">
-          <div className="pointer-events-auto shrink-0">
+        <header className="hidden md:flex pointer-events-none fixed top-3 left-2.5 right-2.5 z-30 items-center justify-between gap-2">
+          <div className="pointer-events-auto flex items-center gap-1.5 shrink-0">
             <MainMenu
               showGrid={showGrid}
               shapeSnapEnabled={shapeSnapEnabled}
@@ -2344,7 +2814,6 @@ export default function App() {
               onOpenExport={() => setExportOpen(true)}
               onOpenThemes={() => setThemeModalOpen(true)}
               onOpenFonts={() => setFontModalOpen(true)}
-              onOpenRustCode={() => setRustModalOpen(true)}
               onOpenCommandPalette={() => setCommandOpen(true)}
               onToggleZenMode={() => setZenMode(true)}
               onLoadDemoCircuit={() => {
@@ -2361,9 +2830,20 @@ export default function App() {
                 if (activeCanvasId) handleRenameHubCanvas(activeCanvasId, nextTitle);
               }}
             />
+            <button
+              type="button"
+              data-testid="workspace-back-to-hub-btn"
+              aria-label="Back to 3D Canvas Hub"
+              title="Back to Spark Hub"
+              onClick={handleOpenHubFromWorkspace}
+              className="rf-panel flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <LayoutGrid className="w-3.5 h-3.5 text-[var(--rf-accent)]" />
+              <span>Hub</span>
+            </button>
           </div>
 
-          <div className="pointer-events-auto">
+          <div className="pointer-events-auto min-w-0">
             <Toolbar
               activeTool={activeTool}
               onSelectTool={(tool) => {
@@ -2375,10 +2855,11 @@ export default function App() {
             />
           </div>
 
-          <div className="pointer-events-auto flex items-center gap-2 shrink-0">
+          <div className="pointer-events-auto flex items-center gap-1.5 shrink-0">
             <button
               type="button"
               aria-label={t.actions.circuits}
+              title={t.actions.circuits}
               aria-pressed={circuitsOpen}
               onClick={() => {
                 setCircuitsOpen((o) => {
@@ -2389,7 +2870,7 @@ export default function App() {
                   return !o;
                 });
               }}
-              className={`rf-panel flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              className={`rf-panel flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                 circuitsOpen
                   ? 'bg-[var(--rf-accent)] text-[var(--rf-accent-fg)] border-transparent'
                   : 'text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)]'
@@ -2401,13 +2882,14 @@ export default function App() {
               }
             >
               <Cpu className="w-4 h-4" />
-              <span className="hidden lg:inline">{t.actions.circuits}</span>
+              <span className="hidden 2xl:inline">{t.actions.circuits}</span>
             </button>
 
             <button
               type="button"
               data-testid="toggle-math-studio"
               aria-label={t.actions.mathEngine}
+              title={t.actions.mathEngine}
               aria-pressed={mathOpen}
               onClick={() => {
                 setMathOpen((o) => {
@@ -2418,7 +2900,7 @@ export default function App() {
                   return !o;
                 });
               }}
-              className={`rf-panel flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              className={`rf-panel flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                 mathOpen
                   ? 'bg-[var(--rf-accent)] text-[var(--rf-accent-fg)] border-transparent'
                   : 'text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)]'
@@ -2430,12 +2912,13 @@ export default function App() {
               }
             >
               <Sigma className="w-4 h-4" />
-              <span className="hidden lg:inline">{t.actions.mathEngine}</span>
+              <span className="hidden 2xl:inline">{t.actions.mathEngine}</span>
             </button>
 
             <button
               type="button"
               aria-label="Simulate"
+              title="Simulate Circuit"
               aria-pressed={simPanelOpen}
               onClick={() => {
                 setSimPanelOpen((o) => {
@@ -2448,7 +2931,7 @@ export default function App() {
                   return !o;
                 });
               }}
-              className={`rf-panel flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              className={`rf-panel flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                 simPanelOpen || simActive
                   ? 'border-emerald-500/50 text-emerald-400'
                   : 'text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)]'
@@ -2460,47 +2943,62 @@ export default function App() {
               }
             >
               <Activity className="w-4 h-4" />
-              <span className="hidden lg:inline">Simulate</span>
+              <span className="hidden 2xl:inline">Simulate</span>
             </button>
 
             {frames.length > 0 && (
               <button
                 type="button"
                 aria-label={t.actions.present}
+                title={t.actions.present}
                 onClick={() => navigateToFrame(0)}
-                className="rf-panel hidden lg:flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] whitespace-nowrap shrink-0"
+                className="rf-panel hidden lg:flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] whitespace-nowrap shrink-0"
               >
                 <Presentation className="w-4 h-4" />
-                <span>{t.actions.present}</span>
+                <span className="hidden 2xl:inline">{t.actions.present}</span>
               </button>
             )}
 
             <button
               type="button"
               aria-label={t.actions.export}
+              title={t.actions.export}
               onClick={() => setExportOpen(true)}
-              className="rf-panel flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] whitespace-nowrap shrink-0"
+              className="rf-panel flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-semibold text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] whitespace-nowrap shrink-0"
             >
               <Download className="w-4 h-4" />
-              <span className="hidden xl:inline">{t.actions.export}</span>
+              <span className="hidden 2xl:inline">{t.actions.export}</span>
             </button>
 
             <button
               type="button"
+              data-testid="workspace-collab-btn"
               aria-label={t.actions.collaborate}
+              title={t.actions.collaborate}
               onClick={() => setCollabModalOpen(true)}
               style={
-                collab.roomId
+                collab.roomId && (activeCanvasRecord?.shareEnabled || peerCount > 0)
                   ? { backgroundColor: '#059669', color: '#ffffff' }
                   : { backgroundColor: 'var(--rf-accent)', color: 'var(--rf-accent-fg)' }
               }
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold shadow-sm hover:opacity-95 whitespace-nowrap shrink-0"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold shadow-sm hover:opacity-95 whitespace-nowrap shrink-0 cursor-pointer"
             >
-              {collab.roomId ? <Lock className="w-3.5 h-3.5" /> : <Users className="w-3.5 h-3.5" />}
+              <Users className="w-3.5 h-3.5" />
               <span className="hidden xl:inline">
-                {collab.roomId ? `E2EE (${peerCount + 1})` : t.actions.collaborate}
+                {collab.roomId && (activeCanvasRecord?.shareEnabled || peerCount > 0)
+                  ? `Live (${peerCount + 1})`
+                  : t.actions.collaborate}
               </span>
             </button>
+
+            <UserProfileControl
+              user={authUser}
+              authLoading={authLoading}
+              syncState={cloudSyncState}
+              variant="canvas"
+              onSignInGoogle={handleGoogleSignIn}
+              onSignOut={handleGoogleSignOut}
+            />
           </div>
         </header>
       )}
@@ -2571,7 +3069,6 @@ export default function App() {
           onOpenCollab={() => setCollabModalOpen(true)}
           onOpenThemes={() => setThemeModalOpen(true)}
           onOpenFonts={() => setFontModalOpen(true)}
-          onOpenRustCode={() => setRustModalOpen(true)}
           onOpenCommandPalette={() => setCommandOpen(true)}
           onOpenFileImport={() => sceneFileInputRef.current?.click()}
           onToggleGrid={() => setShowGrid((g) => !g)}
@@ -2606,6 +3103,16 @@ export default function App() {
           onOpenMathStudio={handleOpenMathStudio}
           onOpenCanvasHub={handleOpenHubFromWorkspace}
           activeCanvasTitle={activeCanvasRecord?.title}
+          mobileAccountSlot={
+            <UserProfileControl
+              user={authUser}
+              authLoading={authLoading}
+              syncState={cloudSyncState}
+              variant="mobile"
+              onSignInGoogle={handleGoogleSignIn}
+              onSignOut={handleGoogleSignOut}
+            />
+          }
         />
       )}
 
@@ -2979,10 +3486,23 @@ export default function App() {
       />
       <CollabModal
         open={collabModalOpen}
+        user={authUser}
+        boardId={activeCanvasId}
+        boardTitle={activeCanvasRecord?.title || 'Untitled Canvas'}
+        isOwner={
+          Boolean(authUser) &&
+          (!activeCanvasRecord?.ownerId || activeCanvasRecord.ownerId === authUser?.uid)
+        }
+        shareEnabled={Boolean(activeCanvasRecord?.shareEnabled)}
+        collaborators={activeCanvasRecord?.collaborators || []}
         collab={collab}
-        onStartSession={handleStartCollabSession}
-        onStopSession={handleStopCollabSession}
-        onUpdatePeerName={(name) => setCollab((prev) => ({ ...prev, peerName: name }))}
+        onSignInGoogle={handleGoogleSignIn}
+        onToggleSharing={handleToggleBoardSharing}
+        onAddCollaboratorUid={handleAddCollaboratorUid}
+        onJoinBoard={handleJoinBoardById}
+        onStopLiveSession={() => {
+          void handleToggleBoardSharing(false);
+        }}
         onClose={() => setCollabModalOpen(false)}
       />
       <CommandPalette

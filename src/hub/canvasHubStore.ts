@@ -71,6 +71,9 @@ export interface SpatialCanvasRecord {
   spatialPosition?: SpatialPosition;
   elements: WhiteboardElement[];
   lastViewport: CanvasLastViewport;
+  ownerId?: string;
+  collaborators?: string[];
+  shareEnabled?: boolean;
 }
 
 export interface CategoryMeta {
@@ -1047,6 +1050,9 @@ export function createBlankSpatialCanvas(
   options?: {
     canvasThemeId?: CanvasThemeId;
     spatialPosition?: SpatialPosition;
+    ownerId?: string;
+    collaborators?: string[];
+    shareEnabled?: boolean;
   }
 ): SpatialCanvasRecord {
   const now = Date.now();
@@ -1072,6 +1078,9 @@ export function createBlankSpatialCanvas(
     },
     elements,
     lastViewport: extractLastViewport(elements, camera),
+    ownerId: options?.ownerId,
+    collaborators: options?.collaborators || [],
+    shareEnabled: options?.shareEnabled ?? false,
   };
 }
 
@@ -1114,6 +1123,11 @@ export function loadHubCanvases(legacyElements?: WhiteboardElement[]): SpatialCa
             spatialPosition,
             elements,
             lastViewport: item.lastViewport || extractLastViewport(elements, camera),
+            ownerId: typeof item.ownerId === 'string' ? item.ownerId : undefined,
+            collaborators: Array.isArray(item.collaborators)
+              ? item.collaborators.filter((c: unknown): c is string => typeof c === 'string')
+              : [],
+            shareEnabled: typeof item.shareEnabled === 'boolean' ? item.shareEnabled : false,
           };
         });
       }

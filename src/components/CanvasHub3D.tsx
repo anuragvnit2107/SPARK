@@ -5,8 +5,6 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
   ArrowRight,
   Check,
-  ChevronDown,
-  ChevronUp,
   Crosshair,
   Edit3,
   Maximize2,
@@ -30,7 +28,6 @@ import {
   SpatialCanvasRecord,
   SpatialPosition,
   formatRelativeTime,
-  searchCanvases,
 } from '../hub/canvasHubStore';
 import {
   BoardTextureMode,
@@ -38,6 +35,22 @@ import {
   renderBoardThumbnailDataUrl,
 } from '../hub/boardTextureRenderer';
 import { CANVAS_THEMES } from '../themes';
+import {
+  SpatialDirection,
+  filterCanvasesByTitle,
+  findNearestCanvasInDirection,
+  shouldRevealBottomDock,
+} from '../hub/hubNavigation';
+import {
+  CLOSE_ZOOM_THRESHOLD,
+  ENTER_TARGET_DISTANCE,
+  EXIT_START_DISTANCE,
+  INSPECT_DISTANCE,
+  computeEnterDurationMs,
+  computeEnterTransitionVisuals,
+  computeReturnFadeInOpacity,
+  evaluateHubZoomState,
+} from '../hub/hubZoomTransition';
 
 export type HubSpaceThemePreference = 'system' | 'light' | 'dark';
 export type HubSpaceTheme = 'light' | 'dark';
@@ -65,6 +78,10 @@ function getSystemDarkMatches(): boolean {
 interface CanvasHub3DProps {
   canvases: SpatialCanvasRecord[];
   activeCanvasId: string | null;
+  isActive?: boolean;
+  returnCanvasId?: string | null;
+  onPrepareCanvas?: (canvasId: string) => void;
+  onReturnTransitionHandled?: () => void;
   onOpenCanvas: (canvasId: string) => void;
   onCreateBlankCanvas: (
     category?: CanvasCategory,
@@ -75,6 +92,8 @@ interface CanvasHub3DProps {
   onAutoArrange?: () => void;
   onDeleteCanvas: (canvasId: string) => void;
   onBackToSplash: () => void;
+  headerProfileSlot?: React.ReactNode;
+  renderHeaderProfile?: (isDark: boolean) => React.ReactNode;
 }
 
 interface BoardRuntime {
@@ -95,8 +114,6 @@ interface BoardRuntime {
   signature: string;
 }
 
-const CLOSE_ZOOM_THRESHOLD = 16.5;
-const INSPECT_DISTANCE = 7.4;
 const BOARD_W = 5.6;
 const BOARD_H = 3.5;
 
@@ -393,6 +410,10 @@ const _toBoardVec = new THREE.Vector3();
 export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
   canvases,
   activeCanvasId,
+  isActive = true,
+  returnCanvasId = null,
+  onPrepareCanvas,
+  onReturnTransitionHandled,
   onOpenCanvas,
   onCreateBlankCanvas,
   onRenameCanvas,
@@ -400,7 +421,11 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
   onAutoArrange,
   onDeleteCanvas,
   onBackToSplash,
+  headerProfileSlot,
+  renderHeaderProfile,
 }) => {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const hudChromeRef = useRef<HTMLDivElement | null>(null);
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [spaceThemePref, setSpaceThemePref] = useState<HubSpaceThemePreference>(
     loadInitialSpaceThemePreference
@@ -410,19 +435,29 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     spaceThemePref === 'system' ? (systemIsDark ? 'dark' : 'light') : spaceThemePref;
 
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchDropdownOpen, setSearchDropdownOpen] = useState(false);
+  const [searchSelectedIndex, setSearchSelectedIndex] = useState(0);
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [closeInspectId, setCloseInspectId] = useState<string | null>(null);
+  const [enteringBoardId, setEnteringBoardId] = useState<string | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [isDraggingBoard, setIsDraggingBoard] = useState(false);
   const [webglError, setWebglError] = useState(false);
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
-  const [controlsCollapsed, setControlsCollapsed] = useState(false);
   const [interactionTool, setInteractionTool] = useState<'drag' | 'orbit'>('drag');
   const [autoRotateEnabled, setAutoRotateEnabled] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [switcherQuery, setSwitcherQuery] = useState('');
   const [switcherIndex, setSwitcherIndex] = useState(0);
+  const [bottomDockRevealed, setBottomDockRevealed] = useState(() => {
+    try {
+      return typeof window !== 'undefined' && window.matchMedia?.('(hover: none)').matches;
+    } catch {
+      return false;
+    }
+  });
   const [hudAnchor, setHudAnchor] = useState<{ x: number; y: number; visible: boolean }>({
     x: 0,
     y: 0,
@@ -431,13 +466,36 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
 
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchContainerRef = useRef<HTMLDivElement | null>(null);
+  const switcherInputRef = useRef<HTMLInputElement | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
+  const isHoveringDockRef = useRef(false);
+  const hideDockTimerRef = useRef<number | null>(null);
 
   const visibleCanvases = useMemo(
-    () => searchCanvases(canvases, searchQuery, 'All'),
+    () => filterCanvasesByTitle(canvases, searchQuery),
     [canvases, searchQuery]
   );
   const visibleCanvasesRef = useRef(visibleCanvases);
   visibleCanvasesRef.current = visibleCanvases;
+
+  const switcherResults = useMemo(
+    () => filterCanvasesByTitle(canvases, switcherQuery),
+    [canvases, switcherQuery]
+  );
+  const switcherResultsRef = useRef(switcherResults);
+  switcherResultsRef.current = switcherResults;
+
+  const searchActive = searchQuery.trim().length > 0;
+  const searchActiveRef = useRef(searchActive);
+  searchActiveRef.current = searchActive;
+
+  const matchingCanvasIds = useMemo(
+    () => new Set(visibleCanvases.map((c) => c.id)),
+    [visibleCanvases]
+  );
+  const matchingCanvasIdsRef = useRef(matchingCanvasIds);
+  matchingCanvasIdsRef.current = matchingCanvasIds;
 
   const activeInspectionRecord = useMemo(() => {
     const id = focusedId || closeInspectId;
@@ -445,6 +503,9 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     return canvases.find((c) => c.id === id) || null;
   }, [canvases, closeInspectId, focusedId]);
 
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
+  const isSoftwareRef = useRef(false);
   const spaceThemeRef = useRef(spaceTheme);
   spaceThemeRef.current = spaceTheme;
   const canvasesRef = useRef(canvases);
@@ -455,12 +516,18 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
   hoveredIdRef.current = hoveredId;
   const closeInspectIdRef = useRef(closeInspectId);
   closeInspectIdRef.current = closeInspectId;
+  const editingTitleIdRef = useRef(editingTitleId);
+  editingTitleIdRef.current = editingTitleId;
   const interactionToolRef = useRef(interactionTool);
   interactionToolRef.current = interactionTool;
   const autoRotateRef = useRef(autoRotateEnabled);
   autoRotateRef.current = autoRotateEnabled;
   const onUpdateCanvasPositionRef = useRef(onUpdateCanvasPosition);
   onUpdateCanvasPositionRef.current = onUpdateCanvasPosition;
+  const onPrepareCanvasRef = useRef(onPrepareCanvas);
+  onPrepareCanvasRef.current = onPrepareCanvas;
+  const onOpenCanvasRef = useRef(onOpenCanvas);
+  onOpenCanvasRef.current = onOpenCanvas;
 
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -470,6 +537,25 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
   const boardsMapRef = useRef<Map<string, BoardRuntime>>(new Map());
   const keysPressedRef = useRef<Set<string>>(new Set());
   const walkVelocityRef = useRef(new THREE.Vector3());
+  const startLoopRef = useRef<(() => void) | null>(null);
+  const stopLoopRef = useRef<(() => void) | null>(null);
+  const resizeViewportRef = useRef<(() => void) | null>(null);
+
+  const enterTransitionRef = useRef<{
+    boardId: string;
+    startedAt: number;
+    durationMs: number;
+    camTargetPos: THREE.Vector3;
+    lookTargetPos: THREE.Vector3;
+    completed: boolean;
+  } | null>(null);
+  const returnFadeRef = useRef<{ active: boolean; startedAt: number; durationMs: number }>({
+    active: false,
+    startedAt: 0,
+    durationMs: 220,
+  });
+  const suppressAutoEnterUntilRef = useRef<number>(0);
+  const requirePullBackForIdRef = useRef<string | null>(null);
 
   const envRefs = useRef<{
     skyMat: THREE.ShaderMaterial;
@@ -548,20 +634,31 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
 
+  const resetOrbitMomentum = useCallback(() => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+    const prevDamping = controls.enableDamping;
+    controls.enableDamping = false;
+    controls.update();
+    controls.enableDamping = prevDamping;
+  }, []);
+
   const flyToBoard = useCallback(
     (boardId: string, distance = INSPECT_DISTANCE, onArrive?: () => void) => {
+      if (enterTransitionRef.current) return;
       const runtime = boardsMapRef.current.get(boardId);
       if (!runtime) {
         if (onArrive) onArrive();
         return;
       }
+      resetOrbitMomentum();
       const boardPos = runtime.targetPos.clone();
       const normal = new THREE.Vector3(0, 0, 1).applyAxisAngle(
         new THREE.Vector3(0, 1, 0),
         runtime.targetRotY
       );
       const camPos = boardPos.clone().addScaledVector(normal, distance);
-      camPos.y += 0.14;
+      if (distance > 5.5) camPos.y += 0.14;
       flyTargetRef.current = {
         camPos,
         targetPos: boardPos,
@@ -570,30 +667,36 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
         onArrive,
       };
     },
-    []
+    [resetOrbitMomentum]
   );
 
   const flyToOverview = useCallback(() => {
+    if (enterTransitionRef.current) return;
+    resetOrbitMomentum();
+    focusedIdRef.current = null;
+    closeInspectIdRef.current = null;
     setFocusedId(null);
     setCloseInspectId(null);
+    suppressAutoEnterUntilRef.current = performance.now() + 700;
     flyTargetRef.current = {
       camPos: new THREE.Vector3(0, 1.8, 31.5),
       targetPos: new THREE.Vector3(0, 0, 0),
       active: true,
       startedAt: performance.now(),
     };
-  }, []);
+  }, [resetOrbitMomentum]);
 
   const zoomCameraBy = useCallback((deltaDist: number) => {
     const cam = cameraRef.current;
     const controls = controlsRef.current;
-    if (!cam || !controls) return;
+    if (!cam || !controls || enterTransitionRef.current) return;
     flyTargetRef.current.active = false;
+    flyTargetRef.current.onArrive = undefined;
     const dir = new THREE.Vector3().subVectors(controls.target, cam.position);
     const dist = dir.length();
     if (dist < 0.001) return;
     dir.normalize();
-    const step = THREE.MathUtils.clamp(deltaDist, -dist + 2.8, 12);
+    const step = THREE.MathUtils.clamp(deltaDist, -dist + 2.0, 12);
     cam.position.addScaledVector(dir, step);
     controls.update();
   }, []);
@@ -610,46 +713,178 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     }
   }, []);
 
-  const launchCanvasWithZoom = useCallback(
-    (canvasId: string) => {
-      const runtime = boardsMapRef.current.get(canvasId);
-      if (!runtime) {
-        onOpenCanvas(canvasId);
+  const startEnterCanvasTransition = useCallback(
+    (boardId: string) => {
+      if (enterTransitionRef.current) return;
+      const runtime = boardsMapRef.current.get(boardId);
+      const cam = cameraRef.current;
+      const controls = controlsRef.current;
+      if (!runtime || !cam || !controls) {
+        onPrepareCanvasRef.current?.(boardId);
+        onOpenCanvasRef.current(boardId);
         return;
       }
-      setFocusedId(canvasId);
-      flyToBoard(canvasId, 3.6, () => {
-        onOpenCanvas(canvasId);
-      });
+
+      // Preload target canvas underneath the 3D hub so crossfade has zero flash
+      onPrepareCanvasRef.current?.(boardId);
+
+      flyTargetRef.current.active = false;
+      flyTargetRef.current.onArrive = undefined;
+      dragBoardRef.current = null;
+      setIsDraggingBoard(false);
+      setSwitcherOpen(false);
+      setEditingTitleId(null);
+      focusedIdRef.current = boardId;
+      closeInspectIdRef.current = boardId;
+      setFocusedId(boardId);
+      setCloseInspectId(boardId);
+      setEnteringBoardId(boardId);
+
+      controls.enabled = false;
+      controls.autoRotate = false;
+      resetOrbitMomentum();
+
+      const boardPos = runtime.targetPos.clone();
+      const normal = new THREE.Vector3(0, 0, 1).applyAxisAngle(
+        new THREE.Vector3(0, 1, 0),
+        runtime.targetRotY
+      );
+      const camTargetPos = boardPos.clone().addScaledVector(normal, ENTER_TARGET_DISTANCE);
+      const startDist = cam.position.distanceTo(boardPos);
+
+      enterTransitionRef.current = {
+        boardId,
+        startedAt: performance.now(),
+        durationMs: computeEnterDurationMs(startDist),
+        camTargetPos,
+        lookTargetPos: boardPos,
+        completed: false,
+      };
     },
-    [flyToBoard, onOpenCanvas]
+    [resetOrbitMomentum]
   );
 
+  const launchCanvasWithZoom = useCallback(
+    (canvasId: string) => {
+      startEnterCanvasTransition(canvasId);
+    },
+    [startEnterCanvasTransition]
+  );
+
+  const startEnterCanvasTransitionRef = useRef(startEnterCanvasTransition);
+  startEnterCanvasTransitionRef.current = startEnterCanvasTransition;
   const launchCanvasWithZoomRef = useRef(launchCanvasWithZoom);
   launchCanvasWithZoomRef.current = launchCanvasWithZoom;
   const flyToBoardRef = useRef(flyToBoard);
   flyToBoardRef.current = flyToBoard;
 
-  const cycleCanvasViaSwitcher = useCallback(
-    (reverse = false, showOverlay = true) => {
-      const list = visibleCanvasesRef.current;
-      if (list.length === 0) return;
+  const focusBoardById = useCallback(
+    (boardId: string) => {
+      keysPressedRef.current.clear();
+      setSwitcherOpen(false);
+      setSearchDropdownOpen(false);
+      setFocusedId(boardId);
+      setCloseInspectId(boardId);
+      focusedIdRef.current = boardId;
+      closeInspectIdRef.current = boardId;
+      flyToBoard(boardId, INSPECT_DISTANCE);
+    },
+    [flyToBoard]
+  );
 
+  const openQuickSwitcher = useCallback(
+    (advanceSelection = false) => {
+      const list = canvasesRef.current;
+      if (list.length === 0) return;
       const currentId = focusedIdRef.current || closeInspectIdRef.current || activeCanvasId;
       let currIdx = currentId ? list.findIndex((c) => c.id === currentId) : -1;
-      if (currIdx < 0) currIdx = reverse ? 0 : -1;
+      if (currIdx < 0) currIdx = advanceSelection ? -1 : 0;
+      const initialIdx = advanceSelection
+        ? (currIdx + 1) % list.length
+        : Math.max(0, currIdx);
 
-      const nextIdx = (currIdx + (reverse ? -1 : 1) + list.length) % list.length;
-      const nextCanvas = list[nextIdx];
-      if (!nextCanvas) return;
-
-      setSwitcherIndex(nextIdx);
-      if (showOverlay) setSwitcherOpen(true);
-      setFocusedId(nextCanvas.id);
-      setCloseInspectId(nextCanvas.id);
-      flyToBoard(nextCanvas.id, INSPECT_DISTANCE);
+      setSearchDropdownOpen(false);
+      setSwitcherQuery('');
+      setSwitcherIndex(initialIdx);
+      setSwitcherOpen(true);
+      setTimeout(() => {
+        switcherInputRef.current?.focus();
+        switcherInputRef.current?.select();
+      }, 20);
     },
-    [activeCanvasId, flyToBoard]
+    [activeCanvasId]
+  );
+
+  const focusNextCanvas = useCallback(() => {
+    const list = visibleCanvasesRef.current.length > 0 ? visibleCanvasesRef.current : canvasesRef.current;
+    if (list.length === 0) return;
+    const currentId = focusedIdRef.current || closeInspectIdRef.current || activeCanvasId;
+    let currIdx = currentId ? list.findIndex((c) => c.id === currentId) : -1;
+    if (currIdx < 0) currIdx = -1;
+    const nextCanvas = list[(currIdx + 1) % list.length];
+    if (nextCanvas) focusBoardById(nextCanvas.id);
+  }, [activeCanvasId, focusBoardById]);
+
+  const jumpFocusedBoardInDirection = useCallback(
+    (direction: SpatialDirection) => {
+      const currentId = focusedIdRef.current || closeInspectIdRef.current;
+      if (!currentId) return;
+
+      const sourceList =
+        searchActiveRef.current &&
+        visibleCanvasesRef.current.length > 1 &&
+        visibleCanvasesRef.current.some((c) => c.id === currentId)
+          ? visibleCanvasesRef.current
+          : canvasesRef.current;
+
+      const candidates = sourceList
+        .map((c) => {
+          const rt = boardsMapRef.current.get(c.id);
+          const pos = rt?.targetPos || c.spatialPosition;
+          if (!pos) return null;
+          return {
+            id: c.id,
+            position: { x: pos.x, y: pos.y, z: pos.z },
+          };
+        })
+        .filter((item): item is { id: string; position: { x: number; y: number; z: number } } =>
+          Boolean(item)
+        );
+
+      const cam = cameraRef.current;
+      let cameraRight = { x: 1, y: 0, z: 0 };
+      let cameraUp = { x: 0, y: 1, z: 0 };
+      let cameraForward = { x: 0, y: 0, z: -1 };
+      if (cam) {
+        const fwd = new THREE.Vector3();
+        cam.getWorldDirection(fwd);
+        fwd.normalize();
+        const right = new THREE.Vector3().crossVectors(fwd, _walkUp);
+        if (right.lengthSq() < 1e-5) {
+          right.set(1, 0, 0);
+        } else {
+          right.normalize();
+        }
+        const up = new THREE.Vector3().crossVectors(right, fwd).normalize();
+        cameraRight = { x: right.x, y: right.y, z: right.z };
+        cameraUp = { x: up.x, y: up.y, z: up.z };
+        cameraForward = { x: fwd.x, y: fwd.y, z: fwd.z };
+      }
+
+      const nextId = findNearestCanvasInDirection({
+        currentId,
+        direction,
+        candidates,
+        cameraRight,
+        cameraUp,
+        cameraForward,
+      });
+
+      if (nextId) {
+        focusBoardById(nextId);
+      }
+    },
+    [focusBoardById]
   );
 
   const startInlineRename = useCallback((record: SpatialCanvasRecord) => {
@@ -706,44 +941,203 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     }, 45);
   }, [flyToBoard, onCreateBlankCanvas, spaceTheme]);
 
-  // Global keyboard shortcuts: Alt+Tab switcher + Ctrl+K + WASD space walking
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.altKey && (e.code === 'Tab' || e.key === 'Tab')) {
-        e.preventDefault();
-        e.stopPropagation();
-        cycleCanvasViaSwitcher(e.shiftKey, true);
-        return;
+    setSearchSelectedIndex((prev) =>
+      visibleCanvases.length === 0 ? 0 : Math.min(prev, visibleCanvases.length - 1)
+    );
+  }, [visibleCanvases.length]);
+
+  useEffect(() => {
+    setSwitcherIndex((prev) =>
+      switcherResults.length === 0 ? 0 : Math.min(prev, switcherResults.length - 1)
+    );
+  }, [switcherResults.length]);
+
+  useEffect(() => {
+    if (!searchDropdownOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (!searchContainerRef.current?.contains(e.target as Node)) {
+        setSearchDropdownOpen(false);
       }
+    };
+    window.addEventListener('mousedown', onPointerDown);
+    return () => window.removeEventListener('mousedown', onPointerDown);
+  }, [searchDropdownOpen]);
+
+  // Intelligent auto-hide for bottom-center dock: reveal only when cursor moves near the bottom
+  useEffect(() => {
+    if (!isActive) return;
+    const isTouchOnly =
+      typeof window !== 'undefined' && window.matchMedia?.('(hover: none)').matches;
+    if (isTouchOnly) {
+      setBottomDockRevealed(true);
+      return;
+    }
+
+    const clearHideTimer = () => {
+      if (hideDockTimerRef.current !== null) {
+        window.clearTimeout(hideDockTimerRef.current);
+        hideDockTimerRef.current = null;
+      }
+    };
+
+    const scheduleHide = () => {
+      clearHideTimer();
+      hideDockTimerRef.current = window.setTimeout(() => {
+        hideDockTimerRef.current = null;
+        if (!isHoveringDockRef.current) {
+          setBottomDockRevealed(false);
+        }
+      }, 320);
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') return;
+      const reveal = shouldRevealBottomDock({
+        clientY: e.clientY,
+        viewportHeight: window.innerHeight,
+        isHoveringDock: isHoveringDockRef.current,
+      });
+      if (reveal) {
+        clearHideTimer();
+        setBottomDockRevealed(true);
+      } else if (!isHoveringDockRef.current) {
+        setBottomDockRevealed((curr) => {
+          if (curr && hideDockTimerRef.current === null) {
+            scheduleHide();
+          }
+          return curr;
+        });
+      }
+    };
+
+    const onWindowLeave = () => {
+      if (!isHoveringDockRef.current) {
+        scheduleHide();
+      }
+    };
+
+    window.addEventListener('pointermove', onPointerMove, { passive: true });
+    document.addEventListener('mouseleave', onWindowLeave);
+    return () => {
+      clearHideTimer();
+      window.removeEventListener('pointermove', onPointerMove);
+      document.removeEventListener('mouseleave', onWindowLeave);
+    };
+  }, [isActive]);
+
+  // Global keyboard shortcuts: Ctrl+K search, Shift+Tab / Ctrl+\ Spotlight switcher, directional focus arrows & WASD space walking
+  useEffect(() => {
+    if (!isActive) return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (enterTransitionRef.current) return;
 
       const target = e.target as HTMLElement | null;
       const isTyping =
         target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
 
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      const isCtrlOrCmd = e.metaKey || e.ctrlKey;
+      const isCtrlBackslash =
+        isCtrlOrCmd && !e.altKey && (e.code === 'Backslash' || e.key === '\\');
+      const isShiftTab = e.shiftKey && !e.altKey && !isCtrlOrCmd && (e.code === 'Tab' || e.key === 'Tab');
+
+      if (isCtrlOrCmd && e.key.toLowerCase() === 'k') {
         e.preventDefault();
+        e.stopPropagation();
+        setSwitcherOpen(false);
+        setSearchDropdownOpen(true);
+        setSearchSelectedIndex(0);
         searchInputRef.current?.focus();
         searchInputRef.current?.select();
         return;
       }
 
-      if (e.key === 'Escape') {
+      if (isCtrlBackslash) {
+        e.preventDefault();
+        e.stopPropagation();
         if (switcherOpen) {
           setSwitcherOpen(false);
+        } else {
+          openQuickSwitcher(false);
+        }
+        return;
+      }
+
+      if (isShiftTab && !editingTitleId) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!switcherOpen) {
+          openQuickSwitcher(true);
+        } else if (switcherResultsRef.current.length > 0) {
+          setSwitcherIndex((prev) => (prev + 1) % switcherResultsRef.current.length);
+        }
+        return;
+      }
+
+      if (switcherOpen) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          setSwitcherOpen(false);
+        }
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        if (searchDropdownOpen) {
+          setSearchDropdownOpen(false);
+          searchInputRef.current?.blur();
           return;
         }
         if (editingTitleId) {
           setEditingTitleId(null);
           return;
         }
-        setFocusedId(null);
-        setCloseInspectId(null);
+        if (closeInspectId || focusedId) {
+          e.preventDefault();
+          flyToOverview();
+        }
         return;
       }
 
       if (isTyping) return;
 
+      const currentFocused = closeInspectIdRef.current || focusedIdRef.current;
       const code = e.code;
+
+      // Directional arrow jumping while focused on a canvas board
+      if (currentFocused) {
+        if (code === 'ArrowUp') {
+          e.preventDefault();
+          e.stopPropagation();
+          keysPressedRef.current.clear();
+          jumpFocusedBoardInDirection('up');
+          return;
+        }
+        if (code === 'ArrowDown') {
+          e.preventDefault();
+          e.stopPropagation();
+          keysPressedRef.current.clear();
+          jumpFocusedBoardInDirection('down');
+          return;
+        }
+        if (code === 'ArrowLeft') {
+          e.preventDefault();
+          e.stopPropagation();
+          keysPressedRef.current.clear();
+          jumpFocusedBoardInDirection('left');
+          return;
+        }
+        if (code === 'ArrowRight') {
+          e.preventDefault();
+          e.stopPropagation();
+          keysPressedRef.current.clear();
+          jumpFocusedBoardInDirection('right');
+          return;
+        }
+      }
+
       if (
         code === 'KeyW' ||
         code === 'KeyA' ||
@@ -765,27 +1159,22 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
 
       if (e.key === '/') {
         e.preventDefault();
+        setSearchDropdownOpen(true);
         searchInputRef.current?.focus();
-      } else if (e.key === 'Enter' && (closeInspectId || focusedId)) {
+      } else if (e.key === 'Enter' && currentFocused) {
         e.preventDefault();
         setSwitcherOpen(false);
-        launchCanvasWithZoom((closeInspectId || focusedId)!);
+        setSearchDropdownOpen(false);
+        launchCanvasWithZoom(currentFocused);
       }
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
       keysPressedRef.current.delete(e.code);
-      if (
-        (e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight') &&
-        switcherOpen
-      ) {
-        setSwitcherOpen(false);
-      }
     };
 
     const onBlur = () => {
       keysPressedRef.current.clear();
-      setSwitcherOpen(false);
     };
 
     window.addEventListener('keydown', onKeyDown, { capture: true });
@@ -798,10 +1187,14 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     };
   }, [
     closeInspectId,
-    cycleCanvasViaSwitcher,
     editingTitleId,
+    flyToOverview,
     focusedId,
+    isActive,
+    jumpFocusedBoardInDirection,
     launchCanvasWithZoom,
+    openQuickSwitcher,
+    searchDropdownOpen,
     switcherOpen,
   ]);
 
@@ -811,6 +1204,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     if (!container) return;
 
     const isSoftware = detectSoftwareWebGL();
+    isSoftwareRef.current = isSoftware;
     const reducedMotion =
       typeof window !== 'undefined' &&
       window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -890,7 +1284,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = !isSoftware;
     controls.dampingFactor = 0.065;
-    controls.minDistance = 2.6;
+    controls.minDistance = 1.8;
     controls.maxDistance = 85;
     controls.maxPolarAngle = Math.PI * 0.85;
     controls.minPolarAngle = Math.PI * 0.12;
@@ -1112,6 +1506,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     };
 
     const onPointerDown = (e: PointerEvent) => {
+      if (enterTransitionRef.current) return;
       pointerDownPos = { x: e.clientX, y: e.clientY };
       if (e.button !== 0 || interactionToolRef.current === 'orbit') return;
 
@@ -1151,6 +1546,11 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     };
 
     const onWheelWhileDragging = (e: WheelEvent) => {
+      if (enterTransitionRef.current) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       const drag = dragBoardRef.current;
       if (!drag) return;
       e.preventDefault();
@@ -1197,6 +1597,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
         }
       }
 
+      if (enterTransitionRef.current) return;
       controls.enabled = true;
       const moved = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
       if (moved > 6 || e.button !== 0) return;
@@ -1252,12 +1653,17 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     };
+    resizeViewportRef.current = onResize;
     window.addEventListener('resize', onResize);
 
     let prevTime = performance.now();
     let rafId = 0;
 
     const animate = (now: number) => {
+      if (!isActiveRef.current) {
+        rafId = 0;
+        return;
+      }
       rafId = requestAnimationFrame(animate);
       const delta = Math.min(0.05, Math.max(0.001, (now - prevTime) / 1000));
       prevTime = now;
@@ -1268,6 +1674,81 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
         ribbonMatA.uniforms.uTime.value = tSec;
         ribbonMatB.uniforms.uTime.value = tSec;
         ribbonMatC.uniforms.uTime.value = tSec;
+      }
+
+      if (returnFadeRef.current.active && rootRef.current) {
+        const fade = computeReturnFadeInOpacity(
+          now - returnFadeRef.current.startedAt,
+          returnFadeRef.current.durationMs
+        );
+        rootRef.current.style.opacity = String(fade);
+        if (fade >= 1) {
+          returnFadeRef.current.active = false;
+        }
+      }
+
+      const activeEnter = enterTransitionRef.current;
+      if (activeEnter && !activeEnter.completed) {
+        controls.autoRotate = false;
+        camera.position.x = THREE.MathUtils.damp(
+          camera.position.x,
+          activeEnter.camTargetPos.x,
+          10,
+          delta
+        );
+        camera.position.y = THREE.MathUtils.damp(
+          camera.position.y,
+          activeEnter.camTargetPos.y,
+          10,
+          delta
+        );
+        camera.position.z = THREE.MathUtils.damp(
+          camera.position.z,
+          activeEnter.camTargetPos.z,
+          10,
+          delta
+        );
+
+        controls.target.x = THREE.MathUtils.damp(
+          controls.target.x,
+          activeEnter.lookTargetPos.x,
+          12,
+          delta
+        );
+        controls.target.y = THREE.MathUtils.damp(
+          controls.target.y,
+          activeEnter.lookTargetPos.y,
+          12,
+          delta
+        );
+        controls.target.z = THREE.MathUtils.damp(
+          controls.target.z,
+          activeEnter.lookTargetPos.z,
+          12,
+          delta
+        );
+        controls.update();
+
+        const rawProgress = (now - activeEnter.startedAt) / activeEnter.durationMs;
+        const { progress, hudOpacity, hubOpacity } = computeEnterTransitionVisuals(rawProgress);
+        if (hudChromeRef.current) {
+          hudChromeRef.current.style.opacity = String(hudOpacity);
+        }
+        if (rootRef.current) {
+          rootRef.current.style.opacity = String(hubOpacity);
+        }
+
+        renderer.render(scene, camera);
+
+        if (progress >= 1) {
+          activeEnter.completed = true;
+          enterTransitionRef.current = null;
+          setEnteringBoardId(null);
+          controls.enabled = true;
+          if (hudChromeRef.current) hudChromeRef.current.style.opacity = '1';
+          onOpenCanvasRef.current(activeEnter.boardId);
+        }
+        return;
       }
 
       controls.autoRotate = Boolean(
@@ -1323,49 +1804,52 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
 
       // Smooth camera fly-to
       if (flyTargetRef.current.active) {
-        const lambda = 7.5;
+        const camLambda = 7.5;
+        const targetLambda = 11.5;
         camera.position.x = THREE.MathUtils.damp(
           camera.position.x,
           flyTargetRef.current.camPos.x,
-          lambda,
+          camLambda,
           delta
         );
         camera.position.y = THREE.MathUtils.damp(
           camera.position.y,
           flyTargetRef.current.camPos.y,
-          lambda,
+          camLambda,
           delta
         );
         camera.position.z = THREE.MathUtils.damp(
           camera.position.z,
           flyTargetRef.current.camPos.z,
-          lambda,
+          camLambda,
           delta
         );
 
         controls.target.x = THREE.MathUtils.damp(
           controls.target.x,
           flyTargetRef.current.targetPos.x,
-          lambda,
+          targetLambda,
           delta
         );
         controls.target.y = THREE.MathUtils.damp(
           controls.target.y,
           flyTargetRef.current.targetPos.y,
-          lambda,
+          targetLambda,
           delta
         );
         controls.target.z = THREE.MathUtils.damp(
           controls.target.z,
           flyTargetRef.current.targetPos.z,
-          lambda,
+          targetLambda,
           delta
         );
 
         const dist = camera.position.distanceTo(flyTargetRef.current.camPos);
         const elapsed = now - flyTargetRef.current.startedAt;
-        const arriveByTime = Boolean(flyTargetRef.current.onArrive) && elapsed > 360;
-        if (dist < 0.22 || arriveByTime) {
+        const arriveByTime = Boolean(flyTargetRef.current.onArrive) && elapsed > 420;
+        if (dist < 0.14 || arriveByTime) {
+          camera.position.copy(flyTargetRef.current.camPos);
+          controls.target.copy(flyTargetRef.current.targetPos);
           flyTargetRef.current.active = false;
           const cb = flyTargetRef.current.onArrive;
           flyTargetRef.current.onArrive = undefined;
@@ -1378,6 +1862,9 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
       // Update boards, hover/focus highlights, and Semantic Close-Zoom LOD
       let nearestCloseId: string | null = null;
       let nearestCloseDist = Infinity;
+      let nearestBoardDot = 0;
+      let focusedBoardDist = Infinity;
+      let focusedBoardDot = 0;
       camera.getWorldDirection(_camDirVec);
 
       boardsMapRef.current.forEach((rt, idxKey) => {
@@ -1386,6 +1873,9 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
         const isDraggingThis = dragBoardRef.current?.boardId === rt.id && dragBoardRef.current.hasMoved;
         const isHover = hoveredIdRef.current === rt.id;
         const isFocus = focusedIdRef.current === rt.id;
+        const isSearchActive = searchActiveRef.current;
+        const isSearchMatch = isSearchActive && matchingCanvasIdsRef.current.has(rt.id);
+        const isSearchDimmed = isSearchActive && !isSearchMatch;
         const camDist = camera.position.distanceTo(rt.group.position);
         const wantInspect = camDist < CLOSE_ZOOM_THRESHOLD || isFocus;
 
@@ -1404,14 +1894,22 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
           rt.group.rotation.y = THREE.MathUtils.damp(rt.group.rotation.y, rt.targetRotY, 7.5, delta);
         }
 
-        const desiredScale = isDraggingThis ? 1.05 : isFocus ? 1.04 : isHover ? 1.02 : 1.0;
+        const desiredScale = isDraggingThis
+          ? 1.05
+          : isFocus || isSearchMatch
+            ? 1.04
+            : isHover
+              ? 1.02
+              : isSearchDimmed
+                ? 0.94
+                : 1.0;
         const nextScale = THREE.MathUtils.damp(rt.group.scale.x, desiredScale, 10, delta);
         rt.group.scale.setScalar(nextScale);
 
         const edgeMat = rt.highlightEdges.material as THREE.LineBasicMaterial;
         edgeMat.opacity = THREE.MathUtils.damp(
           edgeMat.opacity,
-          isFocus || isDraggingThis ? 0.92 : isHover ? 0.55 : 0.0,
+          isFocus || isDraggingThis || isSearchMatch ? 0.92 : isHover ? 0.55 : 0.0,
           12,
           delta
         );
@@ -1419,37 +1917,105 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
         const glowMat = rt.glowMesh.material as THREE.MeshBasicMaterial;
         glowMat.opacity = THREE.MathUtils.damp(
           glowMat.opacity,
-          isFocus || isDraggingThis ? 0.52 : isHover ? 0.34 : 0.16,
+          isFocus || isDraggingThis || isSearchMatch
+            ? 0.54
+            : isHover
+              ? 0.34
+              : isSearchDimmed
+                ? 0.03
+                : 0.16,
           10,
           delta
         );
 
+        const targetFaceOpacity = isSearchDimmed ? 0.22 : 1.0;
+        const faceMat = rt.faceMesh.material as THREE.MeshBasicMaterial;
+        const nextFaceOpacity = THREE.MathUtils.damp(faceMat.opacity, targetFaceOpacity, 10, delta);
+        const snappedFaceOpacity =
+          targetFaceOpacity === 1.0 && nextFaceOpacity > 0.985 ? 1.0 : nextFaceOpacity;
+        if (Math.abs(faceMat.opacity - snappedFaceOpacity) > 0.002) {
+          faceMat.opacity = snappedFaceOpacity;
+          const wantTransp = snappedFaceOpacity < 0.99;
+          if (faceMat.transparent !== wantTransp) {
+            faceMat.transparent = wantTransp;
+            faceMat.needsUpdate = true;
+          }
+        }
+
+        const targetFrameOpacity = isSearchDimmed ? 0.34 : 1.0;
+        const frameMat = rt.frameMesh.material as THREE.MeshPhysicalMaterial;
+        const nextFrameOpacity = THREE.MathUtils.damp(frameMat.opacity, targetFrameOpacity, 10, delta);
+        const snappedFrameOpacity =
+          targetFrameOpacity === 1.0 && nextFrameOpacity > 0.985 ? 1.0 : nextFrameOpacity;
+        if (Math.abs(frameMat.opacity - snappedFrameOpacity) > 0.002) {
+          frameMat.opacity = snappedFrameOpacity;
+          const wantFrameTransp = snappedFrameOpacity < 0.99;
+          if (frameMat.transparent !== wantFrameTransp) {
+            frameMat.transparent = wantFrameTransp;
+            frameMat.needsUpdate = true;
+          }
+        }
+
         const targetMode: BoardTextureMode = wantInspect ? 'inspect' : 'overview';
         if (rt.currentMode !== targetMode) {
           rt.currentMode = targetMode;
-          const faceMat = rt.faceMesh.material as THREE.MeshBasicMaterial;
           faceMat.map = wantInspect ? rt.inspectTexture : rt.overviewTexture;
           faceMat.needsUpdate = true;
         }
 
-        if (camDist < CLOSE_ZOOM_THRESHOLD) {
-          _toBoardVec.copy(rt.group.position).sub(camera.position).normalize();
-          const inFront = _toBoardVec.dot(_camDirVec) > 0.35;
-          if (inFront && camDist < nearestCloseDist) {
-            nearestCloseDist = camDist;
-            nearestCloseId = rt.id;
-          }
+        _toBoardVec.copy(rt.group.position).sub(camera.position).normalize();
+        const forwardDot = _toBoardVec.dot(_camDirVec);
+
+        if (isFocus) {
+          focusedBoardDist = camDist;
+          focusedBoardDot = forwardDot;
+        }
+
+        if (camDist < CLOSE_ZOOM_THRESHOLD && forwardDot > 0.35 && camDist < nearestCloseDist) {
+          nearestCloseDist = camDist;
+          nearestCloseId = rt.id;
+          nearestBoardDot = forwardDot;
         }
       });
 
-      const resolvedCloseId = focusedIdRef.current || nearestCloseId;
-      if (resolvedCloseId !== closeInspectIdRef.current) {
-        setCloseInspectId(resolvedCloseId);
+      if (
+        requirePullBackForIdRef.current &&
+        (focusedIdRef.current !== requirePullBackForIdRef.current || focusedBoardDist > 5.8)
+      ) {
+        requirePullBackForIdRef.current = null;
+      }
+
+      const suppressAutoEnter =
+        now < suppressAutoEnterUntilRef.current || Boolean(requirePullBackForIdRef.current);
+
+      const zoomEval = evaluateHubZoomState({
+        focusedId: focusedIdRef.current,
+        nearestCloseId,
+        nearestCloseDist,
+        focusedBoardDist,
+        focusedBoardDot,
+        nearestBoardDot,
+        isFlying: flyTargetRef.current.active,
+        isDragging: Boolean(dragBoardRef.current?.hasMoved),
+        isEditingTitle: Boolean(editingTitleIdRef.current),
+        isEntering: Boolean(enterTransitionRef.current),
+        suppressAutoEnter,
+      });
+
+      if (zoomEval.shouldUnfocus) {
+        focusedIdRef.current = null;
+        closeInspectIdRef.current = null;
+        setFocusedId(null);
+        setCloseInspectId(null);
+      } else if (zoomEval.enterCandidateId) {
+        startEnterCanvasTransitionRef.current(zoomEval.enterCandidateId);
+      } else if (zoomEval.closeInspectId !== closeInspectIdRef.current) {
+        setCloseInspectId(zoomEval.closeInspectId);
       }
 
       // Project anchored floating HUD coordinates above the selected/close card (never obscuring the canvas)
       const anchorBoardId = !dragBoardRef.current?.hasMoved
-        ? focusedIdRef.current || resolvedCloseId
+        ? (zoomEval.shouldUnfocus ? null : focusedIdRef.current || zoomEval.closeInspectId)
         : null;
       const anchorRt = anchorBoardId ? boardsMapRef.current.get(anchorBoardId) : undefined;
       if (anchorRt && anchorRt.group.visible) {
@@ -1462,8 +2028,10 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
           const sx = (_projVec.x * 0.5 + 0.5) * w;
           const sy = (-_projVec.y * 0.5 + 0.5) * h;
           const halfPad = Math.min(260, Math.floor(w * 0.42));
+          const headerBottom = headerRef.current?.getBoundingClientRect().bottom || 70;
+          const minAnchorY = Math.max(122, Math.ceil(headerBottom) + 52);
           const clampedX = Math.round(Math.max(halfPad, Math.min(w - halfPad, sx)));
-          const clampedY = Math.round(Math.max(122, Math.min(h - 76, sy)));
+          const clampedY = Math.round(Math.max(minAnchorY, Math.min(h - 76, sy)));
           setHudAnchor((prev) =>
             Math.abs(prev.x - clampedX) > 2.5 ||
             Math.abs(prev.y - clampedY) > 2.5 ||
@@ -1481,10 +2049,30 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
       renderer.render(scene, camera);
     };
 
-    rafId = requestAnimationFrame(animate);
+    const startLoop = () => {
+      if (rafId === 0 && isActiveRef.current) {
+        prevTime = performance.now();
+        rafId = requestAnimationFrame(animate);
+      }
+    };
+    const stopLoop = () => {
+      if (rafId !== 0) {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+    };
+    startLoopRef.current = startLoop;
+    stopLoopRef.current = stopLoop;
+
+    if (isActiveRef.current) {
+      startLoop();
+    }
 
     return () => {
-      cancelAnimationFrame(rafId);
+      stopLoop();
+      startLoopRef.current = null;
+      stopLoopRef.current = null;
+      resizeViewportRef.current = null;
       window.removeEventListener('resize', onResize);
       window.removeEventListener('pointerup', onPointerUp);
       controls.removeEventListener('start', onControlsStart);
@@ -1548,6 +2136,63 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
       }
     };
   }, []);
+
+  // Pause/resume WebGL loop on visibility change and handle smooth pull-back when returning from a canvas editor
+  useEffect(() => {
+    if (!isActive) {
+      stopLoopRef.current?.();
+      keysPressedRef.current.clear();
+      enterTransitionRef.current = null;
+      setEnteringBoardId(null);
+      if (controlsRef.current) controlsRef.current.enabled = true;
+      return;
+    }
+
+    resizeViewportRef.current?.();
+    if (hudChromeRef.current) {
+      hudChromeRef.current.style.opacity = '1';
+    }
+
+    if (returnCanvasId) {
+      const rt = boardsMapRef.current.get(returnCanvasId);
+      const cam = cameraRef.current;
+      const controls = controlsRef.current;
+      if (rt && cam && controls) {
+        const boardPos = rt.targetPos.clone();
+        const normal = new THREE.Vector3(0, 0, 1).applyAxisAngle(
+          new THREE.Vector3(0, 1, 0),
+          rt.targetRotY
+        );
+        cam.position.copy(boardPos).addScaledVector(normal, EXIT_START_DISTANCE);
+        controls.target.copy(boardPos);
+        controls.enabled = true;
+        resetOrbitMomentum();
+
+        focusedIdRef.current = returnCanvasId;
+        closeInspectIdRef.current = returnCanvasId;
+        setFocusedId(returnCanvasId);
+        setCloseInspectId(returnCanvasId);
+        suppressAutoEnterUntilRef.current = performance.now() + 950;
+        requirePullBackForIdRef.current = returnCanvasId;
+        returnFadeRef.current = {
+          active: true,
+          startedAt: performance.now(),
+          durationMs: 220,
+        };
+        if (rootRef.current) {
+          rootRef.current.style.opacity = '0.05';
+        }
+        flyToBoard(returnCanvasId, INSPECT_DISTANCE);
+      } else if (rootRef.current) {
+        rootRef.current.style.opacity = '1';
+      }
+      onReturnTransitionHandled?.();
+    } else if (rootRef.current) {
+      rootRef.current.style.opacity = '1';
+    }
+
+    startLoopRef.current?.();
+  }, [flyToBoard, isActive, onReturnTransitionHandled, resetOrbitMomentum, returnCanvasId]);
 
   // Dynamically apply Space Theme (Light / Dark) to the 3D studio scene without resetting camera or boards
   useEffect(() => {
@@ -1811,9 +2456,9 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
         }
       }
 
-      rt.group.visible = visibleIds.has(record.id);
+      rt.group.visible = true;
     });
-  }, [canvases, spaceTheme, visibleCanvases]);
+  }, [canvases, spaceTheme]);
 
   const isDark = spaceTheme === 'dark';
 
@@ -1834,14 +2479,24 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
     }
   }, [onAutoArrange, onUpdateCanvasPosition, visibleCanvases]);
 
+  const hubStage = enteringBoardId
+    ? 'entering'
+    : closeInspectId || focusedId
+      ? 'inspect'
+      : 'overview';
+
   return (
     <div
+      ref={rootRef}
       data-testid="canvas-hub-3d"
+      data-hub-stage={hubStage}
+      data-focused-canvas={focusedId || closeInspectId || ''}
       data-space-theme={spaceTheme}
       data-space-pref={spaceThemePref}
+      aria-hidden={!isActive}
       className={`fixed inset-0 z-50 overflow-hidden select-none ${
-        isDark ? 'bg-[#040B09] text-[#ECFDF5]' : 'bg-[#E1F4EC] text-[#064E3B]'
-      }`}
+        isActive ? 'pointer-events-auto visible' : 'pointer-events-none invisible'
+      } ${isDark ? 'bg-[#040B09] text-[#ECFDF5]' : 'bg-[#E1F4EC] text-[#064E3B]'}`}
     >
       {/* 3D Spatial Viewport (Always active in 3D View with zero view-mode switching) */}
       <div ref={mountRef} className="w-full h-full" />
@@ -1888,8 +2543,12 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
         </div>
       )}
 
+      <div ref={hudChromeRef} className="pointer-events-none fixed inset-0 z-20">
       {/* Top Navigation Bar (Clean 3-Zone Contract matching Light/Dark Studio Design, 3D View Only) */}
-      <header className="pointer-events-none fixed top-3.5 left-4 right-4 z-20 flex flex-wrap items-center justify-between gap-3">
+      <header
+        ref={headerRef}
+        className="pointer-events-none fixed top-3.5 left-4 right-4 z-35 flex flex-wrap items-center justify-between gap-3"
+      >
         {/* Zone 1: Brand Pill */}
         <div className={`pointer-events-auto flex items-center rounded-full px-2.5 py-1.5 border ${hudPillClass}`}>
           <button
@@ -1918,63 +2577,176 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
           </button>
         </div>
 
-        {/* Zone 2: Center Search Capsule with Ctrl+K Hint */}
-        <div className={`pointer-events-auto flex items-center rounded-full px-3 py-1.5 border ${hudPillClass}`}>
-          <div className="relative flex items-center">
-            <Search
-              className={`w-3.5 h-3.5 mr-2 shrink-0 ${
-                isDark ? 'text-[#34D399]' : 'text-[#059669]'
-              }`}
-            />
-            <input
-              ref={searchInputRef}
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && visibleCanvases.length > 0) {
-                  e.preventDefault();
-                  const first = visibleCanvases[0];
-                  setFocusedId(first.id);
-                  setCloseInspectId(first.id);
-                  flyToBoard(first.id, INSPECT_DISTANCE);
-                  searchInputRef.current?.blur();
-                } else if (e.key === 'Escape') {
-                  setSearchQuery('');
-                  searchInputRef.current?.blur();
-                }
-              }}
-              placeholder="Search canvases, notes, formulas..."
-              aria-label="Search spatial canvases"
-              className={`w-48 sm:w-64 lg:w-80 bg-transparent py-1 text-xs outline-none ${
-                isDark
-                  ? 'text-[#ECFDF5] placeholder-[#94A3B8]'
-                  : 'text-[#064E3B] placeholder-[#059669]/65'
-              }`}
-            />
-            {searchQuery ? (
-              <button
-                type="button"
-                aria-label="Clear search"
-                onClick={() => setSearchQuery('')}
-                className={`ml-1.5 p-0.5 rounded-full cursor-pointer ${
-                  isDark ? 'text-[#94A3B8] hover:text-white' : 'text-[#059669] hover:text-[#064E3B]'
+        {/* Zone 2: Center Search Capsule with Ctrl+K Hint & Live Results Dropdown */}
+        <div ref={searchContainerRef} className="pointer-events-auto relative">
+          <div className={`flex items-center rounded-full px-3 py-1.5 border ${hudPillClass}`}>
+            <div className="relative flex items-center">
+              <Search
+                className={`w-3.5 h-3.5 mr-2 shrink-0 ${
+                  isDark ? 'text-[#34D399]' : 'text-[#059669]'
                 }`}
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            ) : (
-              <span
-                className={`hidden sm:inline-flex items-center px-2 py-0.5 ml-2 rounded-full text-[10px] font-semibold font-mono-tabular whitespace-nowrap shrink-0 border ${
+              />
+              <input
+                ref={searchInputRef}
+                data-testid="hub-search-input"
+                type="text"
+                value={searchQuery}
+                onFocus={() => setSearchDropdownOpen(true)}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setSearchDropdownOpen(true);
+                  setSearchSelectedIndex(0);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setSearchDropdownOpen(true);
+                    if (visibleCanvases.length > 0) {
+                      setSearchSelectedIndex((prev) => (prev + 1) % visibleCanvases.length);
+                    }
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setSearchDropdownOpen(true);
+                    if (visibleCanvases.length > 0) {
+                      setSearchSelectedIndex(
+                        (prev) => (prev - 1 + visibleCanvases.length) % visibleCanvases.length
+                      );
+                    }
+                  } else if (e.key === 'Enter' && visibleCanvases.length > 0) {
+                    e.preventDefault();
+                    const picked = visibleCanvases[searchSelectedIndex] || visibleCanvases[0];
+                    setSearchDropdownOpen(false);
+                    searchInputRef.current?.blur();
+                    launchCanvasWithZoom(picked.id);
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setSearchQuery('');
+                    setSearchDropdownOpen(false);
+                    searchInputRef.current?.blur();
+                  }
+                }}
+                placeholder="Search canvases by name..."
+                aria-label="Search canvases by name"
+                className={`w-48 sm:w-64 lg:w-80 bg-transparent py-1 text-xs outline-none ${
                   isDark
-                    ? 'bg-white/5 border-white/10 text-[#94A3B8]'
-                    : 'bg-[#F0FAF5] border-[#A7F3D0] text-[#059669]'
+                    ? 'text-[#ECFDF5] placeholder-[#94A3B8]'
+                    : 'text-[#064E3B] placeholder-[#059669]/65'
                 }`}
-              >
-                Ctrl + K
-              </span>
-            )}
+              />
+              {searchQuery ? (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  onClick={() => {
+                    setSearchQuery('');
+                    setSearchSelectedIndex(0);
+                    searchInputRef.current?.focus();
+                  }}
+                  className={`ml-1.5 p-0.5 rounded-full cursor-pointer ${
+                    isDark ? 'text-[#94A3B8] hover:text-white' : 'text-[#059669] hover:text-[#064E3B]'
+                  }`}
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              ) : (
+                <span
+                  className={`hidden sm:inline-flex items-center px-2 py-0.5 ml-2 rounded-full text-[10px] font-semibold font-mono-tabular whitespace-nowrap shrink-0 border ${
+                    isDark
+                      ? 'bg-white/5 border-white/10 text-[#94A3B8]'
+                      : 'bg-[#F0FAF5] border-[#A7F3D0] text-[#059669]'
+                  }`}
+                >
+                  Ctrl + K
+                </span>
+              )}
+            </div>
           </div>
+
+          {searchDropdownOpen && (
+            <div
+              data-testid="hub-search-results"
+              role="listbox"
+              aria-label="Matching canvases"
+              className={`absolute left-0 right-0 top-full mt-2 rounded-2xl border p-1.5 shadow-2xl max-h-80 overflow-y-auto z-50 ${hudPillClass}`}
+            >
+              <div className="flex items-center justify-between px-2.5 py-1 text-[10px] font-semibold opacity-70">
+                <span>
+                  {searchActive
+                    ? `${visibleCanvases.length} matching ${visibleCanvases.length === 1 ? 'canvas' : 'canvases'}`
+                    : `All Canvases (${visibleCanvases.length})`}
+                </span>
+                <span className="font-mono-tabular">Enter to open</span>
+              </div>
+
+              {visibleCanvases.length === 0 ? (
+                <div className="px-3 py-4 text-center text-xs opacity-70">
+                  No canvases match &ldquo;{searchQuery}&rdquo;
+                </div>
+              ) : (
+                <div className="space-y-0.5">
+                  {visibleCanvases.map((c, idx) => {
+                    const isSelected = idx === searchSelectedIndex;
+                    return (
+                      <div
+                        key={c.id}
+                        role="option"
+                        aria-selected={isSelected}
+                        data-testid="hub-search-result-item"
+                        className={`flex items-center gap-1.5 rounded-xl px-1.5 py-1 transition-colors ${
+                          isSelected
+                            ? isDark
+                              ? 'bg-[#10B981]/20 text-[#ECFDF5]'
+                              : 'bg-[#D1FAE5]/85 text-[#064E3B]'
+                            : isDark
+                              ? 'hover:bg-white/8'
+                              : 'hover:bg-[#ECFDF5]'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onMouseEnter={() => setSearchSelectedIndex(idx)}
+                          onClick={() => {
+                            setSearchDropdownOpen(false);
+                            searchInputRef.current?.blur();
+                            launchCanvasWithZoom(c.id);
+                          }}
+                          className="flex-1 min-w-0 flex items-center justify-between gap-2 px-1.5 py-1 text-left cursor-pointer"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-xs font-bold truncate">{c.title}</div>
+                            <div className="text-[10px] opacity-70 truncate">
+                              {c.category} · {c.elementCount} items · {formatRelativeTime(c.updatedAt)}
+                            </div>
+                          </div>
+                          <span className="text-[10px] font-semibold opacity-75 flex items-center gap-1 shrink-0">
+                            <span>Open</span>
+                            <ArrowRight className="w-3 h-3" />
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          title="Focus in 3D space"
+                          aria-label={`Focus ${c.title} in 3D space`}
+                          onClick={() => {
+                            setSearchDropdownOpen(false);
+                            searchInputRef.current?.blur();
+                            focusBoardById(c.id);
+                          }}
+                          className={`p-1.5 rounded-lg shrink-0 cursor-pointer ${
+                            isDark
+                              ? 'text-[#34D399] hover:bg-white/10'
+                              : 'text-[#059669] hover:bg-white'
+                          }`}
+                        >
+                          <Crosshair className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Zone 3: Space Theme Switcher (Light | Dark | System) + New Blank Canvas */}
@@ -2046,125 +2818,52 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
             <Plus className="w-4 h-4" />
             <span>New Blank Canvas</span>
           </button>
+
+          {renderHeaderProfile ? renderHeaderProfile(isDark) : headerProfileSlot}
         </div>
       </header>
 
-      {/* Top-Right Compact Collapsible Workspace Controls Panel */}
-      <aside
-        aria-label="Workspace Controls"
-        className={`hidden md:block fixed top-18 right-4 z-20 w-48 rounded-2xl border overflow-hidden ${hudPillClass}`}
-      >
-        <button
-          type="button"
-          onClick={() => setControlsCollapsed((c) => !c)}
-          className={`w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-bold cursor-pointer ${
-            isDark ? 'hover:bg-white/5' : 'hover:bg-[#F0FAF5]'
-          }`}
-        >
-          <span>Workspace Controls</span>
-          {controlsCollapsed ? (
-            <ChevronDown className="w-3.5 h-3.5 opacity-70" />
-          ) : (
-            <ChevronUp className="w-3.5 h-3.5 opacity-70" />
-          )}
-        </button>
-
-        {!controlsCollapsed && (
-          <div
-            className={`px-3 pb-3 pt-1 space-y-2 border-t text-xs ${
-              isDark ? 'border-white/10' : 'border-[#10B981]/15'
-            }`}
-          >
-            <div className="flex items-center justify-between pt-1">
-              <span className="font-medium opacity-80">Zoom</span>
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  aria-label="Zoom out 3D space"
-                  onClick={() => zoomCameraBy(-4.5)}
-                  className={`w-6 h-6 rounded-full flex items-center justify-center border cursor-pointer ${
-                    isDark
-                      ? 'border-white/15 hover:bg-white/10'
-                      : 'border-[#10B981]/25 hover:bg-[#ECFDF5]'
-                  }`}
-                >
-                  <Minus className="w-3 h-3" />
-                </button>
-                <button
-                  type="button"
-                  aria-label="Zoom in 3D space"
-                  onClick={() => zoomCameraBy(4.5)}
-                  className={`w-6 h-6 rounded-full flex items-center justify-center border cursor-pointer ${
-                    isDark
-                      ? 'border-white/15 hover:bg-white/10'
-                      : 'border-[#10B981]/25 hover:bg-[#ECFDF5]'
-                  }`}
-                >
-                  <Plus className="w-3 h-3" />
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              data-testid="hub-auto-arrange-btn"
-              onClick={handleTriggerAutoArrange}
-              className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-xl font-medium text-left cursor-pointer ${
-                isDark ? 'hover:bg-white/8' : 'hover:bg-[#ECFDF5]'
-              }`}
-            >
-              <Sparkles className="w-3.5 h-3.5 text-[#10B981]" />
-              <span>Auto Arrange</span>
-            </button>
-
-            <button
-              type="button"
-              data-testid="hub-focus-mode-btn"
-              onClick={() => {
-                if (focusedId || closeInspectId) {
-                  flyToOverview();
-                } else if (visibleCanvases.length > 0) {
-                  const target =
-                    visibleCanvases.find((c) => c.id === activeCanvasId) || visibleCanvases[0];
-                  setFocusedId(target.id);
-                  setCloseInspectId(target.id);
-                  flyToBoard(target.id, INSPECT_DISTANCE);
-                }
-              }}
-              className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-xl font-medium text-left cursor-pointer ${
-                isDark ? 'hover:bg-white/8' : 'hover:bg-[#ECFDF5]'
-              }`}
-            >
-              <Crosshair className="w-3.5 h-3.5 text-[#10B981]" />
-              <span>{focusedId || closeInspectId ? 'Space Overview' : 'Focus Mode'}</span>
-            </button>
-          </div>
-        )}
-      </aside>
-
-      {/* Bottom Studio Overlay: Left Editorial Mark, Center Action Dock, Right Alt+Tab Switch */}
+      {/* Bottom Studio Overlay: Centered Unified Action Dock & Bottom-Right Quick Switcher */}
       <div className="pointer-events-none fixed bottom-4 left-4 right-4 z-20 flex items-center justify-between gap-3">
-        {/* Bottom-Left Subtle Brand Wordmark */}
-        <div className="hidden lg:flex flex-col select-none">
-          <div
-            className={`text-sm font-extrabold tracking-widest leading-none ${
-              isDark ? 'text-[#ECFDF5]' : 'text-[#064E3B]'
-            }`}
-          >
-            SPARK HUB
-          </div>
-          <div
-            className={`text-[11px] font-medium mt-1 tracking-wide ${
-              isDark ? 'text-[#6EE7B7]/75' : 'text-[#059669]/80'
-            }`}
-          >
-            Dream · Plan · Create
-          </div>
-        </div>
+        <div className="hidden md:block w-[205px] shrink-0" aria-hidden="true" />
 
-        {/* Bottom-Center Interactive Dock */}
+        {/* Bottom-Center Intelligent Auto-Hide Dock (appears when cursor moves to bottom) */}
         <div
-          className={`pointer-events-auto mx-auto lg:mx-0 flex items-center gap-1 p-1 rounded-full border ${hudPillClass}`}
+          data-testid="hub-bottom-dock"
+          data-dock-visible={bottomDockRevealed ? 'true' : 'false'}
+          aria-hidden={!bottomDockRevealed}
+          onMouseEnter={() => {
+            isHoveringDockRef.current = true;
+            if (hideDockTimerRef.current !== null) {
+              window.clearTimeout(hideDockTimerRef.current);
+              hideDockTimerRef.current = null;
+            }
+            setBottomDockRevealed(true);
+          }}
+          onMouseLeave={(e) => {
+            isHoveringDockRef.current = false;
+            if (
+              !shouldRevealBottomDock({
+                clientY: e.clientY,
+                viewportHeight: window.innerHeight,
+              })
+            ) {
+              if (hideDockTimerRef.current !== null) {
+                window.clearTimeout(hideDockTimerRef.current);
+              }
+              hideDockTimerRef.current = window.setTimeout(() => {
+                hideDockTimerRef.current = null;
+                if (!isHoveringDockRef.current) {
+                  setBottomDockRevealed(false);
+                }
+              }, 260);
+            }
+          }}
+          className={`mx-auto md:mx-0 flex items-center gap-1 p-1 rounded-full border transition-all duration-200 ease-out ${hudPillClass} ${
+            bottomDockRevealed
+              ? 'pointer-events-auto opacity-100 translate-y-0'
+              : 'pointer-events-none opacity-0 translate-y-6'
+          }`}
         >
           <button
             type="button"
@@ -2172,7 +2871,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
             aria-pressed={interactionTool === 'drag'}
             onClick={() => setInteractionTool('drag')}
             title="Click & drag any canvas card anywhere in space"
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
               interactionTool === 'drag'
                 ? isDark
                   ? 'bg-[#10B981]/22 text-[#34D399]'
@@ -2195,7 +2894,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
               setAutoRotateEnabled((r) => !r);
             }}
             title="Toggle camera orbit mode"
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
               autoRotateEnabled || interactionTool === 'orbit'
                 ? isDark
                   ? 'bg-[#10B981]/22 text-[#34D399]'
@@ -2212,17 +2911,77 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
           <button
             type="button"
             data-testid="dock-focus-btn"
-            onClick={() => cycleCanvasViaSwitcher(false, false)}
-            title="Focus next canvas (or press Alt + Tab)"
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
-              isDark
-                ? 'text-[#94A3B8] hover:text-white hover:bg-white/8'
-                : 'text-[#064E3B]/80 hover:bg-[#ECFDF5]'
+            onClick={focusNextCanvas}
+            title="Focus a canvas (use Arrow keys to jump, Enter to open, Esc to exit)"
+            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+              focusedId || closeInspectId
+                ? isDark
+                  ? 'bg-[#10B981]/22 text-[#34D399]'
+                  : 'bg-[#D1FAE5] text-[#064E3B]'
+                : isDark
+                  ? 'text-[#94A3B8] hover:text-white hover:bg-white/8'
+                  : 'text-[#064E3B]/80 hover:bg-[#ECFDF5]'
             }`}
           >
             <Crosshair className="w-3.5 h-3.5" />
             <span>Focus</span>
           </button>
+
+          <div
+            className={`h-4 w-px mx-0.5 ${isDark ? 'bg-white/15' : 'bg-[#064E3B]/15'}`}
+            aria-hidden="true"
+          />
+
+          <div className="flex items-center gap-0.5" role="group" aria-label="Space zoom">
+            <button
+              type="button"
+              data-testid="dock-zoom-out-btn"
+              aria-label="Zoom out 3D space"
+              title="Zoom out"
+              onClick={() => zoomCameraBy(-4.5)}
+              className={`w-7 h-7 rounded-full flex items-center justify-center cursor-pointer ${
+                isDark
+                  ? 'text-[#94A3B8] hover:text-white hover:bg-white/10'
+                  : 'text-[#064E3B]/80 hover:bg-[#ECFDF5]'
+              }`}
+            >
+              <Minus className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              data-testid="dock-zoom-in-btn"
+              aria-label="Zoom in 3D space"
+              title="Zoom in"
+              onClick={() => zoomCameraBy(4.5)}
+              className={`w-7 h-7 rounded-full flex items-center justify-center cursor-pointer ${
+                isDark
+                  ? 'text-[#94A3B8] hover:text-white hover:bg-white/10'
+                  : 'text-[#064E3B]/80 hover:bg-[#ECFDF5]'
+              }`}
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <button
+            type="button"
+            data-testid="hub-auto-arrange-btn"
+            onClick={handleTriggerAutoArrange}
+            title="Auto-arrange unpinned canvases"
+            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+              isDark
+                ? 'text-[#94A3B8] hover:text-white hover:bg-white/8'
+                : 'text-[#064E3B]/80 hover:bg-[#ECFDF5]'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-[#10B981]" />
+            <span className="hidden sm:inline">Auto Arrange</span>
+          </button>
+
+          <div
+            className={`hidden sm:block h-4 w-px mx-0.5 ${isDark ? 'bg-white/15' : 'bg-[#064E3B]/15'}`}
+            aria-hidden="true"
+          />
 
           <button
             type="button"
@@ -2230,7 +2989,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
             aria-pressed={isFullscreen}
             onClick={toggleFullscreen}
             title="Toggle fullscreen studio"
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
               isDark
                 ? 'text-[#94A3B8] hover:text-white hover:bg-white/8'
                 : 'text-[#064E3B]/80 hover:bg-[#ECFDF5]'
@@ -2241,95 +3000,197 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
             ) : (
               <Maximize2 className="w-3.5 h-3.5" />
             )}
-            <span>Fullscreen</span>
+            <span className="hidden lg:inline">Fullscreen</span>
           </button>
         </div>
 
-        {/* Bottom-Right Interactive Alt+Tab Canvas Switch Pill */}
+        {/* Bottom-Right Interactive Shift+Tab Quick Canvas Switch Pill */}
         <button
           type="button"
-          data-testid="alt-tab-switch-trigger"
-          onClick={() => cycleCanvasViaSwitcher(false, true)}
+          data-testid="quick-switch-trigger"
+          onClick={() => openQuickSwitcher(false)}
           className={`pointer-events-auto hidden md:flex items-center gap-2 px-3.5 py-2 rounded-full border text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${hudPillClass}`}
-          title="Press Alt + Tab to cycle canvases"
+          title="Press Shift + Tab or Ctrl + \ to open Quick Canvas Switcher"
         >
           <span
             className={`px-1.5 py-0.5 rounded-md text-[10px] font-mono-tabular font-bold ${
               isDark ? 'bg-[#10B981]/20 text-[#34D399]' : 'bg-[#D1FAE5] text-[#064E3B]'
             }`}
           >
-            Alt + Tab
+            Shift + Tab
           </span>
           <span>Switch Canvas</span>
         </button>
       </div>
 
-      {/* Alt + Tab Quick Canvas Switcher Overlay */}
-      {switcherOpen && visibleCanvases.length > 0 && (
+      {/* Spotlight / VS Code-Style Quick Canvas Switcher Overlay (Shift+Tab / Ctrl+\) */}
+      {switcherOpen && (
         <div
-          data-testid="alt-tab-switcher"
-          role="dialog"
-          aria-label="Canvas switcher"
-          className={`fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-40 max-w-[92vw] rounded-3xl p-3 border shadow-2xl ${hudPillClass}`}
+          className="pointer-events-auto fixed inset-0 z-40 flex items-start justify-center pt-[16vh] px-4 bg-black/25"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setSwitcherOpen(false);
+          }}
         >
-          <div className="flex items-center justify-between px-2 pb-2 text-[11px] font-semibold opacity-75">
-            <span>Switch Canvas</span>
-            <span className="font-mono-tabular">Alt + Tab · Enter to open · Esc to close</span>
-          </div>
-          <div className="flex items-stretch gap-2.5 overflow-x-auto max-w-[82vw] pb-1">
-            {visibleCanvases.map((c, idx) => {
-              const selected = idx === switcherIndex || c.id === focusedId;
-              const cTheme = CANVAS_THEMES[c.canvasThemeId || 'emerald-minimal'];
-              const thumbSrc = renderBoardThumbnailDataUrl(c, 288, 160);
-              return (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => {
-                    setSwitcherIndex(idx);
-                    setFocusedId(c.id);
-                    setCloseInspectId(c.id);
+          <div
+            data-testid="quick-canvas-switcher"
+            role="dialog"
+            aria-label="Quick canvas switcher"
+            className={`w-full max-w-xl rounded-2xl border shadow-2xl overflow-hidden ${hudPillClass}`}
+          >
+            <div
+              className={`flex items-center gap-2.5 px-4 py-3 border-b ${
+                isDark ? 'border-white/10' : 'border-[#10B981]/18'
+              }`}
+            >
+              <Search
+                className={`w-4 h-4 shrink-0 ${isDark ? 'text-[#34D399]' : 'text-[#059669]'}`}
+              />
+              <input
+                ref={switcherInputRef}
+                data-testid="quick-switcher-input"
+                type="text"
+                value={switcherQuery}
+                onChange={(e) => {
+                  setSwitcherQuery(e.target.value);
+                  setSwitcherIndex(0);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (switcherResults.length > 0) {
+                      setSwitcherIndex((prev) => (prev + 1) % switcherResults.length);
+                    }
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (switcherResults.length > 0) {
+                      setSwitcherIndex(
+                        (prev) => (prev - 1 + switcherResults.length) % switcherResults.length
+                      );
+                    }
+                  } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const picked = switcherResults[switcherIndex] || switcherResults[0];
+                    if (picked) {
+                      focusBoardById(picked.id);
+                    }
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    e.stopPropagation();
                     setSwitcherOpen(false);
-                    flyToBoard(c.id, INSPECT_DISTANCE);
-                  }}
-                  onDoubleClick={() => {
-                    setSwitcherOpen(false);
-                    launchCanvasWithZoom(c.id);
-                  }}
-                  className={`w-44 shrink-0 rounded-2xl p-2 border text-left cursor-pointer ${
-                    selected
-                      ? 'border-[#10B981] ring-2 ring-[#10B981]/45'
-                      : isDark
-                        ? 'border-white/10 hover:border-white/25'
-                        : 'border-[#064E3B]/15 hover:border-[#10B981]/50'
-                  }`}
-                  style={{
-                    backgroundColor: isDark ? '#0B1D17' : '#F6FCF9',
-                  }}
-                >
-                  <div
-                    className="h-20 rounded-xl mb-2 border overflow-hidden relative"
-                    style={{
-                      backgroundColor: cTheme?.canvasBg || '#f6faf8',
-                      borderColor: isDark ? 'rgba(255,255,255,0.1)' : 'rgba(6,78,59,0.12)',
-                    }}
-                  >
-                    <img
-                      src={thumbSrc}
-                      alt={c.title}
-                      className="w-full h-full object-cover"
-                      draggable={false}
-                    />
-                  </div>
-                  <div className="text-xs font-bold truncate">{c.title}</div>
-                  <div className="text-[10px] opacity-65 mt-0.5 truncate">
-                    {c.elementCount} items ·{' '}
-                    {c.spatialPosition?.pinned ? 'Pinned · ' : ''}
-                    {formatRelativeTime(c.updatedAt)}
-                  </div>
-                </button>
-              );
-            })}
+                  }
+                }}
+                placeholder="Type a canvas name to jump & focus..."
+                aria-label="Filter canvases in quick switcher"
+                className={`flex-1 bg-transparent text-sm outline-none ${
+                  isDark
+                    ? 'text-[#ECFDF5] placeholder-[#94A3B8]'
+                    : 'text-[#064E3B] placeholder-[#059669]/60'
+                }`}
+              />
+              <span
+                className={`hidden sm:inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-mono-tabular font-semibold border ${
+                  isDark
+                    ? 'bg-white/5 border-white/10 text-[#94A3B8]'
+                    : 'bg-[#F0FAF5] border-[#A7F3D0] text-[#059669]'
+                }`}
+              >
+                Ctrl + \
+              </span>
+            </div>
+
+            <div className="max-h-80 overflow-y-auto p-2 space-y-1">
+              {switcherResults.length === 0 ? (
+                <div className="px-4 py-6 text-center text-xs opacity-70">
+                  No canvases match &ldquo;{switcherQuery}&rdquo;
+                </div>
+              ) : (
+                switcherResults.map((c, idx) => {
+                  const selected = idx === switcherIndex;
+                  const cTheme = CANVAS_THEMES[c.canvasThemeId || 'emerald-minimal'];
+                  const thumbSrc = renderBoardThumbnailDataUrl(c, 160, 96);
+                  return (
+                    <div
+                      key={c.id}
+                      data-testid="quick-switcher-item"
+                      aria-selected={selected}
+                      className={`flex items-center gap-2 rounded-xl px-2 py-1.5 transition-colors ${
+                        selected
+                          ? isDark
+                            ? 'bg-[#10B981]/20 text-[#ECFDF5] ring-1 ring-[#34D399]/50'
+                            : 'bg-[#D1FAE5]/90 text-[#064E3B] ring-1 ring-[#10B981]/50'
+                          : isDark
+                            ? 'hover:bg-white/8'
+                            : 'hover:bg-[#ECFDF5]'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onMouseEnter={() => setSwitcherIndex(idx)}
+                        onClick={() => focusBoardById(c.id)}
+                        className="flex-1 min-w-0 flex items-center gap-3 text-left cursor-pointer"
+                      >
+                        <div
+                          className="w-14 h-9 rounded-lg border overflow-hidden shrink-0"
+                          style={{
+                            backgroundColor: cTheme?.canvasBg || '#f6faf8',
+                            borderColor: isDark ? 'rgba(255,255,255,0.12)' : 'rgba(6,78,59,0.14)',
+                          }}
+                        >
+                          <img
+                            src={thumbSrc}
+                            alt={c.title}
+                            className="w-full h-full object-cover"
+                            draggable={false}
+                          />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-bold truncate">{c.title}</div>
+                          <div className="text-[10px] opacity-70 truncate mt-0.5">
+                            {c.category} · {c.elementCount} items ·{' '}
+                            {c.spatialPosition?.pinned ? 'Pinned · ' : ''}
+                            {formatRelativeTime(c.updatedAt)}
+                          </div>
+                        </div>
+                        {selected && (
+                          <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-mono-tabular font-semibold opacity-80 shrink-0">
+                            Enter ↵
+                          </span>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        title={`Open ${c.title}`}
+                        aria-label={`Open ${c.title}`}
+                        onClick={() => {
+                          setSwitcherOpen(false);
+                          launchCanvasWithZoom(c.id);
+                        }}
+                        className={`p-1.5 rounded-lg shrink-0 cursor-pointer ${
+                          isDark
+                            ? 'text-[#34D399] hover:bg-white/10'
+                            : 'text-[#059669] hover:bg-white'
+                        }`}
+                      >
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div
+              className={`flex items-center justify-between px-4 py-2 border-t text-[10px] font-mono-tabular opacity-75 ${
+                isDark ? 'border-white/10' : 'border-[#10B981]/15'
+              }`}
+            >
+              <span>↑↓ Navigate · Enter Focus</span>
+              <span>Shift+Tab · Esc Close</span>
+            </div>
           </div>
         </div>
       )}
@@ -2467,6 +3328,7 @@ export const CanvasHub3D: React.FC<CanvasHub3DProps> = ({
           </button>
         </div>
       )}
+      </div>
     </div>
   );
 };

@@ -7,7 +7,6 @@ import {
   ChevronDown,
   ChevronUp,
   Circle,
-  Code2,
   Copy,
   Cpu,
   Diamond,
@@ -113,7 +112,6 @@ interface MobileWorkspaceHUDProps {
   onOpenCollab: () => void;
   onOpenThemes: () => void;
   onOpenFonts: () => void;
-  onOpenRustCode: () => void;
   onOpenCommandPalette: () => void;
   onOpenFileImport: () => void;
   onToggleGrid: () => void;
@@ -135,6 +133,7 @@ interface MobileWorkspaceHUDProps {
   onOpenMathStudio: (id: string, tab?: 'equation' | 'matrix' | 'engineering' | 'history') => void;
   onOpenCanvasHub?: () => void;
   activeCanvasTitle?: string;
+  mobileAccountSlot?: React.ReactNode;
 }
 
 export const MobileWorkspaceHUD: React.FC<MobileWorkspaceHUDProps> = ({
@@ -172,7 +171,6 @@ export const MobileWorkspaceHUD: React.FC<MobileWorkspaceHUDProps> = ({
   onOpenCollab,
   onOpenThemes,
   onOpenFonts,
-  onOpenRustCode,
   onOpenCommandPalette,
   onOpenFileImport,
   onToggleGrid,
@@ -194,6 +192,7 @@ export const MobileWorkspaceHUD: React.FC<MobileWorkspaceHUDProps> = ({
   onOpenMathStudio,
   onOpenCanvasHub,
   activeCanvasTitle,
+  mobileAccountSlot,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [moreActionsOpen, setMoreActionsOpen] = useState(false);
@@ -382,6 +381,11 @@ export const MobileWorkspaceHUD: React.FC<MobileWorkspaceHUDProps> = ({
             data-testid="mobile-main-menu"
             className="rf-panel pointer-events-auto fixed top-13 left-2 z-50 w-64 max-w-[calc(100vw-16px)] max-h-[70vh] overflow-y-auto rf-scrollbar rounded-xl p-1.5 space-y-0.5 text-xs"
           >
+            {mobileAccountSlot && (
+              <div className="pb-1 mb-1 border-b border-[var(--rf-border)]">
+                {mobileAccountSlot}
+              </div>
+            )}
             {onOpenCanvasHub && (
               <button
                 type="button"
@@ -423,7 +427,7 @@ export const MobileWorkspaceHUD: React.FC<MobileWorkspaceHUDProps> = ({
               className="w-full flex items-center gap-2.5 px-2.5 py-2.5 rounded-lg text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] text-left"
             >
               <Download className="w-4 h-4 text-[var(--rf-text-muted)]" />
-              <span>{t.actions.export} (PNG, SVG, JSON)</span>
+              <span>{t.actions.exportCanvas}</span>
             </button>
             <div className="my-1 border-t border-[var(--rf-border)]" />
             <button
@@ -473,17 +477,6 @@ export const MobileWorkspaceHUD: React.FC<MobileWorkspaceHUDProps> = ({
             >
               <Type className="w-4 h-4 text-[var(--rf-text-muted)]" />
               <span>{t.actions.fonts}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeAllTopMenus();
-                onOpenRustCode();
-              }}
-              className="w-full flex items-center gap-2.5 px-2.5 py-2.5 rounded-lg text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] text-left"
-            >
-              <Code2 className="w-4 h-4 text-[var(--rf-text-muted)]" />
-              <span>{t.actions.rustCore}</span>
             </button>
             <button
               type="button"
@@ -645,12 +638,12 @@ export const MobileWorkspaceHUD: React.FC<MobileWorkspaceHUDProps> = ({
               className="w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)]"
             >
               {collabRoomId ? (
-                <Lock className="w-4 h-4 text-emerald-400" />
+                <Users className="w-4 h-4 text-emerald-400" />
               ) : (
                 <Users className="w-4 h-4" />
               )}
               <span>
-                {collabRoomId ? `E2EE (${peerCount + 1})` : t.actions.collaborate}
+                {collabRoomId ? `Live (${peerCount + 1})` : t.actions.collaborate}
               </span>
             </button>
           </div>

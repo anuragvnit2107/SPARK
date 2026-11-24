@@ -79,7 +79,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   return (
     <nav
       aria-label="Drawing Tools"
-      className="rf-panel flex items-center gap-1 px-2 py-1.5 rounded-xl overflow-x-auto max-w-[92vw]"
+      className="rf-panel flex items-center gap-0.5 2xl:gap-1 px-1.5 2xl:px-2 py-1 2xl:py-1.5 rounded-xl overflow-x-auto max-w-full"
     >
       {items.map((item) => {
         const isActive = activeTool === item.id;
@@ -105,7 +105,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                   }
                 : undefined
             }
-            className={`relative flex items-center justify-center w-9 h-9 rounded-lg transition-colors shrink-0 ${
+            className={`relative flex items-center justify-center w-8 h-8 2xl:w-9 2xl:h-9 rounded-lg transition-colors shrink-0 ${
               isActive
                 ? 'shadow-sm'
                 : 'text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)]'

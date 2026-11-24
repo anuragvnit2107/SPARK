@@ -63,6 +63,10 @@ import {
   MathGraph3DOverlayCard,
   MathMatrixOverlayCard,
 } from './math/MathCanvasOverlays';
+import {
+  CanvasZoomOutFloorState,
+  evaluateCanvasZoomOutExit,
+} from '../hub/hubZoomTransition';
 
 interface CanvasProps {
   elements: WhiteboardElement[];
@@ -100,6 +104,7 @@ interface CanvasProps {
   onSwitchToggle?: (elementId: string) => void;
   onWebpageClick?: (elementId: string) => void;
   onCursorMove?: (worldPt: Point) => void;
+  onCursorLeave?: () => void;
   onStatusToast?: (msg: string) => void;
   onRotateSelected?: (deltaRad: number) => void;
   onResetRotationSelected?: () => void;
@@ -118,6 +123,7 @@ interface CanvasProps {
     el: WhiteboardElement,
     op: 'simplify' | 'expand' | 'factor' | 'diff' | 'integrate' | 'solve'
   ) => void;
+  onExitToHub?: () => void;
 }
 
 type HandleDir = ResizeHandleDir;
@@ -392,6 +398,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   onSwitchToggle,
   onWebpageClick,
   onCursorMove,
+  onCursorLeave,
   onStatusToast,
   onRotateSelected,
   onResetRotationSelected,
@@ -407,6 +414,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   onPlotEquation2D,
   onPlotEquation3D,
   onQuickMathAction,
+  onExitToHub,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -437,6 +445,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   cameraRef.current = camera;
   const activeToolRef = useRef<ToolType>(activeTool);
   activeToolRef.current = activeTool;
+  const zoomOutFloorRef = useRef<CanvasZoomOutFloorState>({ floorHitCount: 0, lastHitAt: 0 });
 
   const interactionRef = useRef<InteractionState>({
     mode: 'none',
@@ -1552,6 +1561,21 @@ export const Canvas: React.FC<CanvasProps> = ({
       const worldMidX = (startMidLocalX - startCam.x) / startCam.zoom;
       const worldMidY = (startMidLocalY - startCam.y) / startCam.zoom;
 
+      if (onExitToHub) {
+        const exitEval = evaluateCanvasZoomOutExit(
+          camera.zoom,
+          scaleRatio < 0.96,
+          performance.now(),
+          zoomOutFloorRef.current
+        );
+        zoomOutFloorRef.current = exitEval.nextState;
+        if (exitEval.shouldExitToHub && startCam.zoom * scaleRatio < 0.042) {
+          zoomOutFloorRef.current = { floorHitCount: 0, lastHitAt: 0 };
+          onExitToHub();
+          return;
+        }
+      }
+
       onCameraChange({
         zoom: nextZoom,
         x: currMidLocalX - worldMidX * nextZoom,
@@ -1937,12 +1961,27 @@ export const Canvas: React.FC<CanvasProps> = ({
     setRenderTick((t) => t + 1);
   };
 
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+  const handleWheel = (e: WheelEvent) => {
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) {
       const rect = canvasRef.current?.getBoundingClientRect();
       const sx = e.clientX - (rect?.left || 0);
       const sy = e.clientY - (rect?.top || 0);
+      const isZoomingOut = e.deltaY > 0;
+      if (onExitToHub) {
+        const exitEval = evaluateCanvasZoomOutExit(
+          camera.zoom,
+          isZoomingOut,
+          performance.now(),
+          zoomOutFloorRef.current
+        );
+        zoomOutFloorRef.current = exitEval.nextState;
+        if (exitEval.shouldExitToHub) {
+          zoomOutFloorRef.current = { floorHitCount: 0, lastHitAt: 0 };
+          onExitToHub();
+          return;
+        }
+      }
       const zoomFactor = e.deltaY < 0 ? 1.09 : 0.91;
       const nextZoom = Math.min(6, Math.max(0.05, camera.zoom * zoomFactor));
       const worldX = (sx - camera.x) / camera.zoom;
@@ -1960,6 +1999,17 @@ export const Canvas: React.FC<CanvasProps> = ({
       });
     }
   };
+
+  const handleWheelRef = useRef(handleWheel);
+  handleWheelRef.current = handleWheel;
+
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const listener = (ev: WheelEvent) => handleWheelRef.current(ev);
+    el.addEventListener('wheel', listener, { passive: false });
+    return () => el.removeEventListener('wheel', listener);
+  }, []);
 
   const handleDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const worldPt = screenToWorld(e.clientX, e.clientY);
@@ -2099,9 +2149,9 @@ export const Canvas: React.FC<CanvasProps> = ({
           laserHoverWorldRef.current = null;
           clearLongPressTimer();
           activePointersRef.current.delete(e.pointerId);
+          onCursorLeave?.();
         }}
         onPointerCancel={handlePointerUp}
-        onWheel={handleWheel}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
       />

@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import {
-  Code2,
   Command,
   Download,
   Edit3,
@@ -31,7 +30,6 @@ interface MainMenuProps {
   onOpenExport: () => void;
   onOpenThemes: () => void;
   onOpenFonts: () => void;
-  onOpenRustCode: () => void;
   onOpenCommandPalette: () => void;
   onToggleZenMode: () => void;
   onLoadDemoCircuit: () => void;
@@ -53,7 +51,6 @@ export const MainMenu: React.FC<MainMenuProps> = ({
   onOpenExport,
   onOpenThemes,
   onOpenFonts,
-  onOpenRustCode,
   onOpenCommandPalette,
   onToggleZenMode,
   onLoadDemoCircuit,
@@ -87,10 +84,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
             className="rf-panel absolute left-0 top-12 z-50 w-64 rounded-xl p-1.5 space-y-0.5 text-xs"
           >
             {activeCanvasTitle && (
-              <div className="px-2.5 py-1.5 mb-0.5 rounded-lg bg-[var(--rf-surface-elevated)] border border-[var(--rf-border)]">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--rf-text-muted)]">
-                  Active Canvas
-                </div>
+              <div className="px-2.5 py-2 mb-0.5 rounded-lg bg-[var(--rf-surface-elevated)] border border-[var(--rf-border)]">
                 {editingTitle && onRenameActiveCanvas ? (
                   <input
                     type="text"
@@ -109,7 +103,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
                       if (draftTitle.trim()) onRenameActiveCanvas(draftTitle.trim());
                       setEditingTitle(false);
                     }}
-                    className="mt-1 w-full px-1.5 py-1 rounded bg-[var(--rf-bg)] border border-[var(--rf-accent)] text-xs font-semibold text-[var(--rf-text)] outline-none"
+                    className="w-full px-1.5 py-1 rounded bg-[var(--rf-bg)] border border-[var(--rf-accent)] text-xs font-semibold text-[var(--rf-text)] outline-none"
                   />
                 ) : (
                   <button
@@ -119,7 +113,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
                       setDraftTitle(activeCanvasTitle);
                       setEditingTitle(true);
                     }}
-                    className="mt-0.5 w-full flex items-center justify-between gap-1.5 text-left font-semibold text-[var(--rf-text)] hover:text-[var(--rf-accent)]"
+                    className="w-full flex items-center justify-between gap-1.5 text-left font-semibold text-[var(--rf-text)] hover:text-[var(--rf-accent)]"
                   >
                     <span className="truncate">{activeCanvasTitle}</span>
                     {onRenameActiveCanvas && <Edit3 className="w-3 h-3 shrink-0 opacity-70" />}
@@ -135,13 +129,10 @@ export const MainMenu: React.FC<MainMenuProps> = ({
                   setOpen(false);
                   onOpenCanvasHub();
                 }}
-                className="w-full flex items-center justify-between px-2.5 py-2 rounded-lg font-semibold text-[var(--rf-accent)] bg-[var(--rf-accent)]/10 hover:bg-[var(--rf-accent)]/20 text-left"
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg font-semibold text-[var(--rf-accent)] bg-[var(--rf-accent)]/10 hover:bg-[var(--rf-accent)]/20 text-left"
               >
-                <span className="flex items-center gap-2.5">
-                  <LayoutGrid className="w-4 h-4" />
-                  <span>3D Canvas Hub</span>
-                </span>
-                <span className="text-[10px] opacity-80">Spatial</span>
+                <LayoutGrid className="w-4 h-4" />
+                <span>3D Canvas Hub</span>
               </button>
             )}
             <button
@@ -164,7 +155,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
               className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] text-left"
             >
               <Download className="w-4 h-4 text-[var(--rf-text-muted)]" />
-              <span>{t.actions.export} (PNG, SVG, JSON)</span>
+              <span>{t.actions.exportCanvas}</span>
             </button>
 
             <div className="my-1 border-t border-[var(--rf-border)]" />
@@ -206,7 +197,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
               className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] text-left"
             >
               <Palette className="w-4 h-4 text-[var(--rf-text-muted)]" />
-              <span>{t.actions.themes} (10)</span>
+              <span>{t.actions.themes}</span>
             </button>
 
             <button
@@ -219,18 +210,6 @@ export const MainMenu: React.FC<MainMenuProps> = ({
             >
               <Type className="w-4 h-4 text-[var(--rf-text-muted)]" />
               <span>{t.actions.fonts}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setOpen(false);
-                onOpenRustCode();
-              }}
-              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[var(--rf-text)] hover:bg-[var(--rf-surface-hover)] text-left"
-            >
-              <Code2 className="w-4 h-4 text-[var(--rf-text-muted)]" />
-              <span>{t.actions.rustCore}</span>
             </button>
 
             <button

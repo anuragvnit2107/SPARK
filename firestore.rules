@@ -1,0 +1,236 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedSignedIn() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidCamera(cam) {
+      return cam is map
+        && cam.keys().hasAll(['x', 'y', 'zoom'])
+        && cam.keys().hasOnly(['x', 'y', 'zoom'])
+        && cam.x is number
+        && cam.y is number
+        && cam.zoom is number
+        && cam.zoom >= 0.05
+        && cam.zoom <= 10;
+    }
+
+    function isValidSpatialPosition(pos) {
+      return pos is map
+        && pos.keys().hasAll(['x', 'y', 'z', 'rotY'])
+        && pos.keys().hasOnly(['x', 'y', 'z', 'rotY', 'pinned'])
+        && pos.x is number
+        && pos.y is number
+        && pos.z is number
+        && pos.rotY is number
+        && (!('pinned' in pos) || pos.pinned is bool);
+    }
+
+    function isValidBoard(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'title',
+          'category',
+          'tags',
+          'elements',
+          'collaborators',
+          'shareEnabled',
+          'camera',
+          'canvasThemeId',
+          'elementCount',
+          'lastNoteSnippet',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'title',
+          'category',
+          'tags',
+          'elements',
+          'collaborators',
+          'shareEnabled',
+          'camera',
+          'canvasThemeId',
+          'spatialPosition',
+          'elementCount',
+          'lastNoteSnippet',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
+        && data.category is string && data.category in ['Architecture', 'Circuits', 'Math', 'Wireframes']
+        && data.tags is list && data.tags.size() <= 12
+        && (data.tags.size() == 0 || (data.tags[0] is string && data.tags[0].size() <= 40))
+        && data.elements is list && data.elements.size() <= 1000
+        && (data.elements.size() == 0 || (data.elements[0] is map && data.elements[0].id is string && data.elements[0].id.size() <= 128))
+        && data.collaborators is list && data.collaborators.size() <= 25
+        && (data.collaborators.size() == 0 || isValidId(data.collaborators[0]))
+        && data.shareEnabled is bool
+        && isValidCamera(data.camera)
+        && data.canvasThemeId is string && data.canvasThemeId.size() >= 1 && data.canvasThemeId.size() <= 48
+        && (!('spatialPosition' in data) || isValidSpatialPosition(data.spatialPosition))
+        && data.elementCount is int && data.elementCount >= 0 && data.elementCount <= 1000
+        && data.lastNoteSnippet is string && data.lastNoteSnippet.size() <= 200
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isBoardOwner() {
+      return existing().ownerId == request.auth.uid;
+    }
+
+    function isBoardCollaborator() {
+      return request.auth.uid in existing().collaborators;
+    }
+
+    function isBoardOwnerOrCollaborator() {
+      return isBoardOwner() || isBoardCollaborator();
+    }
+
+    function isJoinSharedBoardAction() {
+      return existing().shareEnabled == true
+        && incoming().diff(existing()).affectedKeys().hasOnly(['collaborators', 'updatedAt'])
+        && incoming().collaborators.hasAll(existing().collaborators)
+        && !(request.auth.uid in existing().collaborators)
+        && request.auth.uid in incoming().collaborators
+        && incoming().collaborators.size() == existing().collaborators.size() + 1;
+    }
+
+    function isParentBoardMember(boardId) {
+      let boardPath = /databases/$(database)/documents/boards/$(boardId);
+      return exists(boardPath)
+        && (
+          get(boardPath).data.ownerId == request.auth.uid
+          || request.auth.uid in get(boardPath).data.collaborators
+        );
+    }
+
+    function isValidPresence(data, userId) {
+      return data.keys().hasAll(['peerId', 'name', 'color', 'x', 'y', 'tool', 'updatedAt'])
+        && data.keys().hasOnly(['peerId', 'name', 'color', 'x', 'y', 'tool', 'updatedAt'])
+        && isValidId(data.peerId)
+        && data.peerId == userId
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.color is string && data.color.size() >= 4 && data.color.size() <= 20
+        && data.x is number
+        && data.y is number
+        && data.tool is string && data.tool.size() >= 1 && data.tool.size() <= 32
+        && data.updatedAt is timestamp;
+    }
+
+    match /boards/{boardId} {
+      allow get: if isSignedIn() && isValidId(boardId) && isBoardOwnerOrCollaborator();
+      allow list: if isSignedIn() && (existing().ownerId == request.auth.uid || request.auth.uid in existing().collaborators);
+
+      allow create: if isVerifiedSignedIn()
+        && isValidId(boardId)
+        && isValidBoard(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedSignedIn()
+        && isValidId(boardId)
+        && isValidBoard(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (isBoardOwner() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'category',
+            'tags',
+            'elements',
+            'collaborators',
+            'shareEnabled',
+            'camera',
+            'canvasThemeId',
+            'spatialPosition',
+            'elementCount',
+            'lastNoteSnippet',
+            'updatedAt'
+          ])) ||
+          (isBoardCollaborator() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'elements',
+            'camera',
+            'canvasThemeId',
+            'elementCount',
+            'lastNoteSnippet',
+            'updatedAt'
+          ])) ||
+          isJoinSharedBoardAction()
+        );
+
+      allow delete: if isVerifiedSignedIn()
+        && isValidId(boardId)
+        && isBoardOwner();
+
+      match /presence/{userId} {
+        allow get: if isSignedIn()
+          && isValidId(boardId)
+          && isValidId(userId)
+          && isParentBoardMember(boardId);
+
+        allow list: if isSignedIn()
+          && isValidId(boardId)
+          && isParentBoardMember(boardId);
+
+        allow create: if isVerifiedSignedIn()
+          && isValidId(boardId)
+          && isValidId(userId)
+          && request.auth.uid == userId
+          && isValidPresence(incoming(), userId)
+          && incoming().updatedAt == request.time
+          && isParentBoardMember(boardId);
+
+        allow update: if isVerifiedSignedIn()
+          && isValidId(boardId)
+          && isValidId(userId)
+          && request.auth.uid == userId
+          && isValidPresence(incoming(), userId)
+          && incoming().peerId == existing().peerId
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'color',
+            'x',
+            'y',
+            'tool',
+            'updatedAt'
+          ])
+          && isParentBoardMember(boardId);
+
+        allow delete: if isVerifiedSignedIn()
+          && isValidId(boardId)
+          && isValidId(userId)
+          && request.auth.uid == userId;
+      }
+    }
+  }
+}
